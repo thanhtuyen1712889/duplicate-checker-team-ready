@@ -1,0 +1,206 @@
+template_id: pandapak_product_detail_v1
+template_name: PandaPak Product Detail
+description: >
+  Rule set inferred from the two sample product-detail DOCX files. This template
+  uses a stable Word structure with Title, Heading2 sections, bullet lists,
+  related-products tables, a supplier block, FAQ, and a closing summary.
+
+template_detection:
+  document_family_score_pass: 0.85
+  signals:
+    heading2_patterns:
+      - "(?i)for professional takeaway and delivery"
+      - "(?i)key features|features of"
+      - "(?i)key use cases|use cases of"
+      - "(?i)compatible|related products"
+      - "(?i)trusted supplier|supplier for professional foodservice packaging"
+      - "(?i)frequently asked questions"
+    required_blocks:
+      - title
+      - intro
+      - features
+      - use_cases
+      - supplier
+      - faq
+    optional_blocks:
+      - related_products_table
+      - conclusion
+
+global_rules:
+  sentence_token_window: 45
+  exact_span_red:
+    min_consecutive_sentences: 2
+    min_tokens: 35
+  near_copy_yellow:
+    min_tokens: 25
+    lexical_overlap_ratio: 0.72
+  semantic_similarity:
+    yellow: 0.82
+    red: 0.88
+  fact_heavy_detection:
+    numeric_token_ratio: 0.16
+    unit_patterns:
+      - "\\b\\d+(?:[.-]\\d+)?\\s?(ml|mm|cm|gsm|pcs|pc|units|kg|g)\\b"
+      - "\\b(150mm|183mm|500ml|750ml|900ml|1000ml)\\b"
+      - "\\b(BPA-free|PFAS|PET|PP|PE-coated|UK|EU)\\b"
+    effect: lower_section_weight
+
+sections:
+  title:
+    detection:
+      from_style: Title
+    mode: exact_only
+    weight: 0.1
+    pass_rule: ignore_if_same_template_variable_only
+    notes: Product names will naturally share formatting but should not drive a fail.
+
+  source_url:
+    detection:
+      line_after_title: true
+    mode: ignore
+    weight: 0.0
+
+  hero_heading:
+    detection:
+      heading2_order: 1
+    mode: low_weight
+    weight: 0.2
+    semantic_red: 0.93
+    notes: Usually template-shaped; compare only after removing product tokens.
+
+  intro:
+    detection:
+      between_heading2: ["hero_heading", "features"]
+    mode: mixed
+    weight: 0.8
+    exact_red:
+      min_consecutive_sentences: 2
+      min_tokens: 30
+    semantic_red: 0.87
+    semantic_yellow: 0.81
+    preprocessing:
+      remove_fact_clauses: true
+      remove_product_name: true
+    notes: The factual setup stays similar, but the sales framing should still vary.
+
+  features:
+    detection:
+      heading2_contains:
+        - "(?i)key features"
+        - "(?i)features of"
+    mode: strict_sentence_pairing
+    weight: 1.0
+    split_rules:
+      bullet_label_before_colon: separate
+      bullet_body_after_colon: strict_compare
+      bold_subheading_lines: keep_as_subsection_labels
+    exact_red:
+      min_consecutive_sentences: 2
+      min_tokens: 28
+    semantic_red: 0.88
+    semantic_yellow: 0.83
+    notes: Core value-copy section; highest uniqueness priority.
+
+  use_cases:
+    detection:
+      heading2_contains:
+        - "(?i)key use cases"
+        - "(?i)use cases of"
+    mode: strict_sentence_pairing
+    weight: 1.0
+    exact_red:
+      min_consecutive_sentences: 2
+      min_tokens: 28
+    semantic_red: 0.86
+    semantic_yellow: 0.8
+    notes: Strong paraphrase checking should happen here.
+
+  related_products_table:
+    detection:
+      heading2_contains:
+        - "(?i)compatible"
+        - "(?i)related products"
+      follows_with_table: true
+    mode: allow_high_overlap
+    weight: 0.15
+    ignore_columns:
+      - product
+      - type
+      - material / finish
+      - capacity / size
+      - packaging role
+      - key detail
+      - suitable for
+    notes: This block is mostly structured catalog/fact data.
+
+  supplier:
+    detection:
+      heading2_contains:
+        - "(?i)trusted supplier"
+        - "(?i)supplier for professional foodservice packaging"
+    mode: ignore_or_template
+    weight: 0.0
+    notes: Treat as approved boilerplate for this template family.
+
+  faq:
+    detection:
+      heading2_contains:
+        - "(?i)frequently asked questions"
+    mode: intent_level_compare
+    weight: 0.9
+    split_rules:
+      question: separate
+      answer: strict_compare
+    question_handling:
+      allow_same_intent_if_product_specific: true
+      question_red_if_exact_repeat_count_over: 3
+    answer_semantic_red: 0.87
+    answer_semantic_yellow: 0.82
+    exact_red:
+      min_consecutive_sentences: 2
+      min_tokens: 24
+    notes: Questions may share intent, but answer copy should not feel recycled.
+
+  conclusion:
+    detection:
+      after_section: faq
+    mode: strict
+    weight: 0.7
+    exact_red:
+      min_consecutive_sentences: 1
+      min_tokens: 24
+    semantic_red: 0.86
+    semantic_yellow: 0.8
+
+approved_reuse:
+  exact_phrases:
+    - "Frequently Asked Questions"
+  regex_patterns:
+    - "(?i)free mainland UK delivery.*above £99"
+    - "(?i)produced in compliance with UK and EU food contact"
+    - "(?i)supplied in cases of \\d+"
+    - "(?i)no fixed minimum order quantity"
+    - "(?i)samples are typically dispatched within 1-2 working days"
+
+scoring:
+  section_score_formula: weighted_risk_sum
+  page_status:
+    green:
+      max_total_risk: 24
+      max_red_flags: 0
+    yellow:
+      max_total_risk: 49
+      max_red_flags: 1
+    red:
+      min_total_risk: 50
+      or_red_flags_at_least: 2
+
+review_output:
+  show_top_matches: 3
+  highlight_level: sentence_and_span
+  show_reason_codes:
+    - exact_span
+    - near_copy
+    - semantic_paraphrase
+    - faq_intent_overlap
+    - approved_template_ignored
