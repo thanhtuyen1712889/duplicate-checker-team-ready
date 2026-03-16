@@ -28,6 +28,22 @@ SEO_APP = SeoBrainApp(APP_ROOT)
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/healthz":
+            self.respond_head("text/plain; charset=utf-8")
+            return
+        if parsed.path == "/":
+            self.respond_head("text/html; charset=utf-8")
+            return
+        if not self.require_auth():
+            return
+        if parsed.path in {"/document", "/templates", "/export.csv"}:
+            content_type = "text/csv; charset=utf-8" if parsed.path == "/export.csv" else "text/html; charset=utf-8"
+            self.respond_head(content_type)
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -191,6 +207,12 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def respond_head(self, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def redirect(self, location: str) -> None:
         self.send_response(302)
