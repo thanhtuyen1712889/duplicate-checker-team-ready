@@ -11,6 +11,7 @@ import io
 import json
 import os
 import sys
+import traceback
 from email.parser import BytesParser
 from email.policy import default
 from http import HTTPStatus
@@ -29,54 +30,63 @@ SEO_APP = SeoBrainApp(APP_ROOT)
 
 class AppHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
-            self.respond_head("text/plain; charset=utf-8")
-            return
-        if parsed.path == "/":
-            self.respond_head("text/html; charset=utf-8")
-            return
-        if not self.require_auth():
-            return
-        if parsed.path in {"/document", "/templates", "/export.csv"}:
-            content_type = "text/csv; charset=utf-8" if parsed.path == "/export.csv" else "text/html; charset=utf-8"
-            self.respond_head(content_type)
-            return
-        self.send_error(HTTPStatus.NOT_FOUND)
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self.respond_head("text/plain; charset=utf-8")
+                return
+            if parsed.path == "/":
+                self.respond_head("text/html; charset=utf-8")
+                return
+            if not self.require_auth():
+                return
+            if parsed.path in {"/document", "/templates", "/export.csv"}:
+                content_type = "text/csv; charset=utf-8" if parsed.path == "/export.csv" else "text/html; charset=utf-8"
+                self.respond_head(content_type)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+        except Exception:  # noqa: BLE001
+            self.handle_uncaught_exception()
 
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
-            self.respond_text("ok")
-            return
-        if not self.require_auth():
-            return
-        if parsed.path == "/":
-            self.respond_html(render_dashboard(parsed.query))
-            return
-        if parsed.path == "/document":
-            params = parse_qs(parsed.query)
-            doc_id = int(params.get("id", ["0"])[0] or 0)
-            self.respond_html(render_document(doc_id))
-            return
-        if parsed.path == "/templates":
-            self.respond_html(render_templates(parsed.query))
-            return
-        if parsed.path == "/export.csv":
-            self.respond_csv(render_export_csv(parsed.query), "duplicate-checker-export.csv")
-            return
-        self.send_error(HTTPStatus.NOT_FOUND)
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self.respond_text("ok")
+                return
+            if not self.require_auth():
+                return
+            if parsed.path == "/":
+                self.respond_html(render_dashboard(parsed.query))
+                return
+            if parsed.path == "/document":
+                params = parse_qs(parsed.query)
+                doc_id = int(params.get("id", ["0"])[0] or 0)
+                self.respond_html(render_document(doc_id))
+                return
+            if parsed.path == "/templates":
+                self.respond_html(render_templates(parsed.query))
+                return
+            if parsed.path == "/export.csv":
+                self.respond_csv(render_export_csv(parsed.query), "duplicate-checker-export.csv")
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+        except Exception:  # noqa: BLE001
+            self.handle_uncaught_exception()
 
     def do_POST(self) -> None:
-        if not self.require_auth():
-            return
-        if self.path == "/submit":
-            self.handle_submit()
-            return
-        if self.path == "/templates/create":
-            self.handle_template_create()
-            return
-        self.send_error(HTTPStatus.NOT_FOUND)
+        try:
+            if not self.require_auth():
+                return
+            if self.path == "/submit":
+                self.handle_submit()
+                return
+            if self.path == "/templates/create":
+                self.handle_template_create()
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+        except Exception:  # noqa: BLE001
+            self.handle_uncaught_exception()
 
     def handle_submit(self) -> None:
         fields, files = self.parse_form()
@@ -213,6 +223,24 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def handle_uncaught_exception(self) -> None:
+        self.log_error("Unhandled request error:\n%s", traceback.format_exc())
+        try:
+            self.respond_html(
+                page(
+                    title="Server error",
+                    current_nav="dashboard",
+                    body=(
+                        '<section class="card"><h1>Server Error</h1>'
+                        "<p>Tool vua gap loi noi bo. Vui long quay lai dashboard hoac thu lai sau it phut.</p>"
+                        '<p><a href="/">Quay lai dashboard</a></p></section>'
+                    ),
+                ),
+                status=500,
+            )
+        except BrokenPipeError:
+            pass
 
     def redirect(self, location: str) -> None:
         self.send_response(302)
@@ -562,7 +590,7 @@ def render_export_csv(query_string: str) -> str:
                 row["status"],
                 f"{row['unique_score']:.2f}",
                 row["version"],
-                row["created_at"],
+                format_timestamp(row["created_at"]),
             ]
         )
     return buffer.getvalue()
@@ -576,9 +604,18 @@ def render_document_row(row) -> str:
       <td><span class="status {escape(row['status'])}">{escape(row['status']).upper()}</span></td>
       <td>{row['unique_score']:.1f}</td>
       <td>{row['version']}</td>
-      <td>{escape(row['created_at'][:19].replace('T', ' '))}</td>
+      <td>{escape(format_timestamp(row['created_at']))}</td>
     </tr>
     """
+
+
+def format_timestamp(value) -> str:
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if value is None:
+        return ""
+    text = str(value)
+    return text[:19].replace("T", " ")
 
 
 def render_template_options(templates: list[dict], selected_id: str = "") -> str:
