@@ -163,6 +163,8 @@ class AnalysisResult:
     content_hash: str
     raw_text: str
     signature: dict[str, Any]
+    source_url: str = ""
+    source_kind: str = "upload"
 
 
 def utc_now() -> str:
@@ -291,6 +293,8 @@ class Storage:
             "section_risks": result.section_risks,
             "sections": {name: asdict(section) for name, section in result.sections.items()},
             "findings": [asdict(finding) for finding in result.findings],
+            "source_url": result.source_url,
+            "source_kind": result.source_kind,
         }
         self.supersede_existing(result.document_key)
         if self.use_postgres:
@@ -504,6 +508,58 @@ class Storage:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
         return row
+
+    def delete_document(self, document_id: int) -> dict[str, Any] | None:
+        row = self.get_document(document_id)
+        if not row:
+            return None
+        document_key = str(row["document_key"])
+        display_name = str(row["display_name"])
+        was_superseded = bool(row["superseded"])
+        restored_row = None
+        if self.use_postgres:
+            with self._connect_postgres() as conn:
+                conn.execute("DELETE FROM documents WHERE id = %s", (document_id,))
+                if not was_superseded:
+                    restored_row = conn.execute(
+                        """
+                        SELECT id, display_name
+                        FROM documents
+                        WHERE document_key = %s
+                        ORDER BY version DESC, created_at DESC
+                        LIMIT 1
+                        """,
+                        (document_key,),
+                    ).fetchone()
+                    if restored_row:
+                        conn.execute("UPDATE documents SET superseded = FALSE WHERE id = %s", (restored_row["id"],))
+            return {
+                "document_key": document_key,
+                "display_name": display_name,
+                "restored_document_id": int(restored_row["id"]) if restored_row else 0,
+                "restored_display_name": str(restored_row["display_name"]) if restored_row else "",
+            }
+        with self._connect() as conn:
+            conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            if not was_superseded:
+                restored_row = conn.execute(
+                    """
+                    SELECT id, display_name
+                    FROM documents
+                    WHERE document_key = ?
+                    ORDER BY version DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (document_key,),
+                ).fetchone()
+                if restored_row:
+                    conn.execute("UPDATE documents SET superseded = 0 WHERE id = ?", (restored_row["id"],))
+        return {
+            "document_key": document_key,
+            "display_name": display_name,
+            "restored_document_id": int(restored_row["id"]) if restored_row else 0,
+            "restored_display_name": str(restored_row["display_name"]) if restored_row else "",
+        }
 
 
 def hash_bytes(payload: bytes) -> str:
@@ -828,14 +884,19 @@ class DuplicateCheckerService:
         forced_template_id: str = "",
     ) -> AnalysisResult:
         source_name = source_name or display_name or document_key
+        source_url = ""
+        source_kind = "upload"
         if file_bytes:
             raw_text, blocks = extract_blocks_from_source(source_name, file_bytes)
             content_hash = hash_bytes(file_bytes)
         elif remote_url:
+            source_url = remote_url.strip()
+            source_kind = "google_docs" if parse_google_doc_id(source_url) else "remote_url"
             source_name, file_bytes = fetch_remote_source(remote_url)
             raw_text, blocks = extract_blocks_from_source(source_name, file_bytes)
             content_hash = hash_bytes(file_bytes)
         else:
+            source_kind = "pasted_text"
             raw_text, blocks = extract_blocks_from_text(pasted_text)
             content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
 
@@ -892,6 +953,8 @@ class DuplicateCheckerService:
             content_hash=content_hash,
             raw_text=raw_text,
             signature=signature,
+            source_url=source_url,
+            source_kind=source_kind,
         )
 
     def save_result(self, result: AnalysisResult) -> int:

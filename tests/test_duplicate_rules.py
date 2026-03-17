@@ -1,8 +1,13 @@
+import json
+import os
+import tempfile
 import unittest
 
 from duplicate_checker.service import (
+    AnalysisResult,
     OptionalEmbeddingClient,
     Section,
+    Storage,
     compare_section_sets,
     compare_sections,
     detect_template,
@@ -370,6 +375,71 @@ class DuplicateRuleTests(unittest.TestCase):
         self.assertIn("faq", sections)
         self.assertTrue(sections["features"].text)
         self.assertEqual(sections["source_url"].text, "https://pandapak.ai/kraft-round-bowl-1090ml-300pcs.html")
+
+
+class StorageBehaviorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.template = deep_copy_template(builtin_template_map()["pandapak_product_detail_v1"])
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.previous_database_url = os.environ.pop("DATABASE_URL", None)
+        self.storage = Storage(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        if self.previous_database_url is not None:
+            os.environ["DATABASE_URL"] = self.previous_database_url
+        self.temp_dir.cleanup()
+
+    def _result(self, *, version: int, text: str, source_url: str = "") -> AnalysisResult:
+        sections = {"full_text": make_section("full_text", text, self.template)}
+        return AnalysisResult(
+            document_key="google-doc-abc123",
+            display_name=f"Doc version {version}",
+            version=version,
+            template_id=self.template["id"],
+            template_name=self.template["name"],
+            unique_score=88.0,
+            total_risk=12.0,
+            status="green",
+            sections=sections,
+            section_risks={"full_text": 12.0},
+            findings=[],
+            source_name="google-doc-abc123.docx",
+            content_hash=f"hash-{version}",
+            raw_text=text,
+            signature={"score": 1.0},
+            source_url=source_url,
+            source_kind="google_docs" if source_url else "upload",
+        )
+
+    def test_delete_document_restores_previous_version(self) -> None:
+        first_id = self.storage.save_result(
+            self._result(version=1, text="first snapshot", source_url="https://docs.google.com/document/d/abc123/edit")
+        )
+        second_id = self.storage.save_result(
+            self._result(version=2, text="second snapshot", source_url="https://docs.google.com/document/d/abc123/edit")
+        )
+
+        deleted = self.storage.delete_document(second_id)
+
+        self.assertIsNotNone(deleted)
+        assert deleted is not None
+        self.assertEqual(deleted["restored_document_id"], first_id)
+        latest = self.storage.latest_documents()
+        self.assertEqual(len(latest), 1)
+        self.assertEqual(int(latest[0]["id"]), first_id)
+
+    def test_source_metadata_is_persisted_in_parsed_payload(self) -> None:
+        document_id = self.storage.save_result(
+            self._result(version=1, text="stored snapshot", source_url="https://docs.google.com/document/d/abc123/edit")
+        )
+
+        row = self.storage.get_document(document_id)
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        payload = json.loads(row["parsed_json"])
+        self.assertEqual(payload["source_kind"], "google_docs")
+        self.assertEqual(payload["source_url"], "https://docs.google.com/document/d/abc123/edit")
 
 
 if __name__ == "__main__":
