@@ -8,8 +8,10 @@ PANDAPAK_TEMPLATE = {
     "id": "pandapak_product_detail_v1",
     "name": "PandaPak Product Detail",
     "detection_threshold": 0.85,
+    "unstyled_detection_threshold": 0.45,
     "heading_patterns": [
         r"for professional takeaway and delivery",
+        r"product overview",
         r"key features|features of",
         r"key use cases|use cases of",
         r"compatible|related products",

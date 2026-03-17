@@ -37,6 +37,7 @@ NS = {"w": WORD_NS}
 W_VAL = f"{{{WORD_NS}}}val"
 WORD_RE = re.compile(r"[a-z0-9]+(?:[.-][a-z0-9]+)?", re.IGNORECASE)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+STANDALONE_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 STOPWORDS = {
     "a",
@@ -1201,6 +1202,8 @@ def detect_template(
                 return template, signature
     best_template = FALLBACK_TEMPLATE
     best_score = 0.0
+    all_block_texts = [normalize_compact(block.text) for block in blocks if block.text]
+    merged_text = " \n ".join(all_block_texts)
     for template in templates:
         if template.get("auto_detect_enabled", True) is False:
             continue
@@ -1210,12 +1213,21 @@ def detect_template(
             if any(matcher.search(heading) for heading in heading_texts):
                 hits += 1
         score = hits / len(template["heading_patterns"]) if template["heading_patterns"] else 0.0
+        if not heading_texts and template["heading_patterns"]:
+            content_hits = 0
+            for pattern in template["heading_patterns"]:
+                matcher = re.compile(pattern, re.IGNORECASE)
+                if matcher.search(merged_text):
+                    content_hits += 1
+            content_score = content_hits / len(template["heading_patterns"])
+            score = max(score, content_score)
         if signature["has_table"] and "related_products_table" in template["section_patterns"]:
             score += 0.1
         if signature["has_title"]:
             score += 0.05
         score = min(score, 1.0)
-        if score >= template["detection_threshold"] and score > best_score:
+        threshold = float(template.get("unstyled_detection_threshold", template["detection_threshold"])) if not heading_texts else float(template["detection_threshold"])
+        if score >= threshold and score > best_score:
             best_template = template
             best_score = score
     signature["template_score"] = round(best_score, 3)
@@ -1248,7 +1260,7 @@ def extract_pandapak_sections(blocks: list[Block], template: dict[str, Any]) -> 
         display_name = blocks[0].text
         sections["title"] = make_section("title", blocks[0].text, template)
         cursor = 1
-    if cursor < len(blocks) and URL_RE.match(blocks[cursor].text):
+    if cursor < len(blocks) and looks_like_standalone_url(blocks[cursor].text):
         sections["source_url"] = make_section("source_url", blocks[cursor].text, template)
         cursor += 1
 
@@ -1256,9 +1268,7 @@ def extract_pandapak_sections(blocks: list[Block], template: dict[str, Any]) -> 
         index for index, block in enumerate(blocks[cursor:], start=cursor) if block.style.lower().startswith("heading")
     ]
     if not heading_indices:
-        body_text = "\n\n".join(block.text for block in blocks[cursor:] if block.text)
-        sections["full_text"] = make_section("full_text", body_text, template)
-        return sections, display_name
+        return extract_pandapak_sections_from_flat_text(blocks[cursor:], template, existing_sections=sections, display_name=display_name)
 
     first_heading = heading_indices[0]
     hero_heading_text = blocks[first_heading].text
@@ -1285,6 +1295,107 @@ def extract_pandapak_sections(blocks: list[Block], template: dict[str, Any]) -> 
         body_text = "\n\n".join(block.text for block in body_blocks if block.text)
         sections[section_name] = make_section(section_name, body_text, template, heading=heading_text)
     return sections, display_name
+
+
+def extract_pandapak_sections_from_flat_text(
+    blocks: list[Block],
+    template: dict[str, Any],
+    *,
+    existing_sections: dict[str, Section] | None = None,
+    display_name: str = "",
+) -> tuple[dict[str, Section], str]:
+    sections = dict(existing_sections or {})
+    full_text = "\n\n".join(block.text for block in blocks if block.text)
+    normalized = normalize_space(full_text)
+    if not normalized:
+        if display_name and "title" not in sections:
+            sections["title"] = make_section("title", display_name, template)
+        return sections, display_name
+
+    url_match = URL_RE.match(normalized)
+    if url_match:
+        first_space = normalized.find(" ")
+        first_url = normalized if first_space == -1 else normalized[:first_space]
+        if first_url and "source_url" not in sections:
+            sections["source_url"] = make_section("source_url", first_url, template)
+        normalized = normalize_space(normalized[len(first_url) :])
+
+    marker_patterns = [
+        ("intro", r"\bproduct overview\b"),
+        ("features", r"\b(?:key features(?: of [^.!?\n]{1,120})?|features of [^.!?\n]{1,120})\b"),
+        ("use_cases", r"\b(?:key use cases(?: of [^.!?\n]{1,120})?|use cases of [^.!?\n]{1,120})\b"),
+        ("related_products_table", r"\b(?:compatible|related products)\b"),
+        ("supplier", r"\b(?:trusted supplier|supplier for professional foodservice packaging)\b"),
+        ("faq", r"\bfrequently asked questions\b"),
+    ]
+    positions: list[tuple[int, str, str]] = []
+    for section_name, pattern in marker_patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if match:
+            positions.append((match.start(), section_name, match.group(0)))
+    positions.sort(key=lambda item: item[0])
+
+    title_candidate = ""
+    if positions:
+        title_candidate = normalize_space(normalized[: positions[0][0]].strip(" :-\n"))
+    elif len(normalized) <= 180:
+        title_candidate = normalized
+    if title_candidate and "title" not in sections:
+        sections["title"] = make_section("title", title_candidate, template)
+        display_name = display_name or title_candidate
+
+    if not positions:
+        sections["full_text"] = make_section("full_text", normalized, template)
+        return sections, display_name
+
+    if "hero_heading" not in sections and title_candidate:
+        sections["hero_heading"] = make_section("hero_heading", title_candidate, template, heading=title_candidate)
+
+    for index, (start, section_name, marker_text) in enumerate(positions):
+        end = positions[index + 1][0] if index + 1 < len(positions) else len(normalized)
+        segment = normalize_space(normalized[start:end])
+        segment_body = normalize_space(segment[len(marker_text) :])
+        if section_name == "intro":
+            if segment_body:
+                sections["intro"] = make_section("intro", segment_body, template, heading="Product overview")
+            continue
+        if section_name == "faq":
+            faq_items = recover_faq_items_from_flat_text(segment_body)
+            faq_text = "\n\n".join(
+                f"{item['question']}\n{item['answer']}".strip() for item in faq_items if item["question"] or item["answer"]
+            )
+            sections["faq"] = make_section("faq", faq_text or segment_body, template, heading="Frequently Asked Questions", metadata={"items": faq_items})
+            continue
+        sections[section_name] = make_section(section_name, segment_body, template, heading=marker_text)
+
+    if "intro" not in sections:
+        first_start = positions[0][0]
+        leading = normalize_space(normalized[:first_start])
+        if leading and leading != title_candidate:
+            sections["intro"] = make_section("intro", leading, template)
+    if "full_text" not in sections:
+        sections["full_text"] = make_section("full_text", normalized, template)
+    return sections, display_name
+
+
+def recover_faq_items_from_flat_text(text: str) -> list[dict[str, str]]:
+    normalized = normalize_space(text)
+    if not normalized:
+        return []
+    candidates = re.split(r"(?=(?:q[:.]|question[:.]|what|when|why|how|can|are|is|do|does)\s)", normalized, flags=re.IGNORECASE)
+    items: list[dict[str, str]] = []
+    for chunk in candidates:
+        chunk = normalize_space(chunk)
+        if not chunk:
+            continue
+        question, answer = split_question_answer(chunk)
+        if question or answer:
+            items.append({"question": question, "answer": answer})
+    return items
+
+
+def looks_like_standalone_url(text: str) -> bool:
+    return bool(STANDALONE_URL_RE.fullmatch(normalize_space(text)))
 
 
 def split_faq_and_conclusion(body_blocks: list[Block], template: dict[str, Any]) -> tuple[Section, Section | None]:

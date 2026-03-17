@@ -1,7 +1,16 @@
 import unittest
 
-from duplicate_checker.service import OptionalEmbeddingClient, Section, compare_section_sets, compare_sections, make_section
-from duplicate_checker.template_catalog import deep_copy_template, builtin_template_map
+from duplicate_checker.service import (
+    OptionalEmbeddingClient,
+    Section,
+    compare_section_sets,
+    compare_sections,
+    detect_template,
+    extract_blocks_from_text,
+    extract_sections,
+    make_section,
+)
+from duplicate_checker.template_catalog import builtin_template_map, builtin_templates, deep_copy_template
 
 
 def other_row() -> dict:
@@ -335,6 +344,32 @@ class DuplicateRuleTests(unittest.TestCase):
         self.assertIsNotNone(finding)
         assert finding is not None
         self.assertEqual(finding.reason_label, "same capacity-fit idea")
+
+    def test_unstyled_google_doc_text_still_detects_template_and_sections(self) -> None:
+        text = (
+            "https://pandapak.ai/kraft-round-bowl-1090ml-300pcs.html "
+            "Kraft Round Bowls 1090ml Product overview "
+            "The PandaPak 1090ml kraft round bowl is a high-capacity paper container intended for professional takeaway and delivery use. "
+            "Key Features of Kraft Round Bowls 1090ml "
+            "High-capacity bowl format for large takeaway portions. Moisture-resistant inner lining for sauce-rich foods. "
+            "Key Use Cases of Kraft Round Bowls 1090ml "
+            "Suitable for rice bowls, noodle meals, and larger deli portions. "
+            "Frequently Asked Questions "
+            "Can these bowls handle takeaway delivery? Yes. The sturdy structure helps support food during transport."
+        )
+
+        _, blocks = extract_blocks_from_text(text)
+        template, _signature = detect_template(blocks, builtin_templates())
+        sections, display_name = extract_sections(blocks, template)
+
+        self.assertEqual(template["id"], "pandapak_product_detail_v1")
+        self.assertEqual(display_name, "Kraft Round Bowls 1090ml")
+        self.assertIn("intro", sections)
+        self.assertIn("features", sections)
+        self.assertIn("use_cases", sections)
+        self.assertIn("faq", sections)
+        self.assertTrue(sections["features"].text)
+        self.assertEqual(sections["source_url"].text, "https://pandapak.ai/kraft-round-bowl-1090ml-300pcs.html")
 
 
 if __name__ == "__main__":
