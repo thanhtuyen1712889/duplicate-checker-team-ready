@@ -1,150 +1,147 @@
-# Duplicate Checker + SEO Brain
+# Bộ kiểm tra trùng lặp nội dung thông minh
 
-This workspace contains a lightweight Python app for checking duplicate
-content across product-detail pages that share a known template.
+Ứng dụng web kiểm tra trùng lặp nội dung cho trang sản phẩm, xây bằng `FastAPI + HTML/JS + SQLite`.
 
-It also now includes `SEO Brain`, a local dashboard for importing a manual SEO
-master plan and converting it into a dependency-aware execution system.
+Luồng chính:
 
-## What it does
+1. Tạo dự án.
+2. Thêm bài mẫu để hệ thống tự phát hiện phần được phép trùng.
+3. Thêm bài mới bằng link Google Docs hoặc dán nội dung.
+4. Xem kết quả xung đột, lọc theo section, bài xung đột, mức độ.
+5. Xuất Excel hoặc sao lưu ZIP.
 
-- accepts `.docx` and `.txt` inputs
-- accepts `Google Docs URL` inputs when the document can be fetched
-- auto-detects the PandaPak-style product-detail template
-- allows manual template selection when auto-detect is not enough
-- stores custom templates created from sample files
-- splits content into sections
-- ignores approved boilerplate sections such as supplier content
-- gives lower weight to fact-heavy/table sections
-- checks higher-risk sections such as features, use cases, FAQ answers, and conclusion
-- stores the latest version of each document key in a local SQLite corpus
-- serves a web UI with:
-  - dashboard for content users
-  - filterable corpus list
-  - CSV export
-  - template management page for admins
-  - green/yellow/red results and top findings
+## Tính năng chính
 
-## SEO Brain: what it does
+- Tạo nhiều dự án độc lập.
+- Nhập bài mẫu từ Google Docs hoặc raw text.
+- Tự phát hiện:
+  - regex thông số
+  - cụm từ thương hiệu / tên sản phẩm
+  - câu boilerplate
+  - section được bỏ qua hoàn toàn
+- Tự strip allowed zone trước khi so sánh.
+- So sánh 3 lớp:
+  - n-gram overlap
+  - semantic similarity
+  - sentence-level LCS
+- Guard giảm false positive:
+  - bỏ qua section specs
+  - bỏ qua câu quá ngắn sau stripping
+  - nới ngưỡng cho biến thể cùng dòng sản phẩm
+  - guard semantic cao nhưng n-gram thấp
+  - penalty cho section quá ngắn
+- Hỗ trợ:
+  - re-check từng bài
+  - xóa bài
+  - xóa dự án
+  - nhân bản dự án
+  - backup ZIP
+  - khôi phục lại từ ZIP
 
-- imports `.xlsx` SEO planning workbooks
-- reads `Content Calendar` and `SEO IMAGE AUDIT`
-- creates URL-level task trees for content, onpage, publish, indexation, internal links, and offpage
-- calculates `planned`, `forecast`, and `actual` timing
-- lets you edit KPI targets, page status, task owner, actual deadlines, and done dates inline
-- recalculates warnings after every change
-- stores everything in local SQLite at `data/seo_brain.sqlite3`
-
-## Run locally
-
-```bash
-python3 app.py serve
-```
-
-Open `http://127.0.0.1:8765`.
-
-## Run SEO Brain locally
-
-```bash
-python3 app.py seo-serve
-```
-
-Open `http://127.0.0.1:8876`.
-
-On macOS, you can also double-click:
+## Cấu trúc file
 
 ```text
-start_seo_brain.command
+/Users/bssgroup/Codex test
+├── app.py
+├── smart_duplicate_core.py
+├── requirements.txt
+├── Dockerfile
+├── railway.json
+├── README.md
+├── data/
+│   └── smart_duplicate.sqlite3
+└── tests/
+    └── test_smart_duplicate_core.py
 ```
 
-On macOS, you can also double-click:
+## Chạy local
 
-```text
-start_duplicate_checker.command
-```
-
-This starts the local server and opens the browser automatically.
-
-## Run for the team on one machine
-
-If one machine will host the tool for the whole team on the same local network:
-
-```text
-start_team_server.command
-```
-
-This starts the server on `0.0.0.0` and prints the local network URL.
-
-## Deploy to Render + Supabase
-
-This repo now includes:
-
-- `requirements.txt`
-- `render.yaml`
-- `.env.example`
-
-Recommended production-lite setup:
-
-1. Create a free Supabase project.
-2. In Supabase, copy the Postgres connection string.
-3. Prefer the pooled connection string for app traffic.
-4. Make sure the connection string includes `sslmode=require`.
-5. Create a Render web service from this repo.
-6. Use the included `render.yaml` or set the same values manually.
-7. Add these environment variables in Render:
-   - `DATABASE_URL`
-   - `APP_USERNAME`
-   - `APP_PASSWORD`
-   - optional `OPENAI_API_KEY`
-8. Deploy.
-9. Open the public URL and log in with the basic-auth username/password.
-
-When `DATABASE_URL` is set:
-
-- documents are stored in Postgres instead of local SQLite
-- custom templates created in the UI are also stored in Postgres
-- redeploys and restarts will keep the data
-
-## Files for deployment
-
-- `render.yaml`: Render service definition
-- `.env.example`: sample environment variables
-- `requirements.txt`: Python package list for hosted mode
-
-## Import sample files into the corpus
+Tạo môi trường ảo và cài dependencies:
 
 ```bash
-python3 app.py import "/absolute/path/to/file1.docx" "/absolute/path/to/file2.docx"
+cd "/Users/bssgroup/Codex test"
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+python -m nltk.downloader punkt
 ```
 
-## Import an SEO workbook
+Chạy web app:
 
 ```bash
-python3 app.py seo-import "/absolute/path/to/workbook.xlsx" --name "Pandapak SEO Brain"
+python3.11 app.py serve --host 127.0.0.1 --port 8000
 ```
 
-## Template workflow
+Mở trình duyệt:
 
-1. Open the `Templates` page.
-2. Create a new template from 1-3 sample files.
-3. Pick the closest built-in strategy.
-4. Save the template.
-5. If you upload 2-3 samples, the template can be used for auto-detect more reliably.
-6. Content users can still choose that template manually from the dashboard at any time.
+```text
+http://127.0.0.1:8000
+```
 
-## Recommended content workflow
+## Chạy self-test
 
-1. Writer uploads a DOCX, pastes text, or enters a Google Docs URL.
-2. Writer keeps the same `Ma bai` when resubmitting revisions of the same page.
-3. Tool returns `green`, `yellow`, or `red`.
-4. Writer opens the result page, reviews the highlighted sections, edits, and resubmits.
+```bash
+python3 app.py self-test
+```
 
-## Notes
+Self-test sẽ:
 
-- Duplicate Checker local mode stays lightweight, but SEO Brain needs `openpyxl` for Excel imports.
-- Hosted mode adds `psycopg` from `requirements.txt` so the app can talk to Postgres.
-- If `OPENAI_API_KEY` is present, the scoring engine will try OpenAI embeddings for better semantic similarity and fall back automatically if the request fails.
-- Without an API key, semantic scoring uses a local heuristic based on token cosine and sentence-level overlap.
-- Google Docs fetching depends on the document being accessible from the machine running the app.
-- The hosted app supports HTTP Basic Auth through `APP_USERNAME` and `APP_PASSWORD`.
-- The local team-server mode is still intended for trusted internal networks only.
+- tạo project `Test`
+- thêm 1 bài mẫu
+- thêm 1 bài gần như giống
+- thêm 1 bài paraphrase
+- thêm 1 bài khác hoàn toàn
+- kiểm tra rằng:
+  - bài giống bị `🔴`
+  - bài paraphrase bị `🟡` hoặc `🔴`
+  - bài khác bị `✅`
+  - section specs không gây flag sai
+
+## API chính
+
+- `POST /api/project/create`
+- `GET /api/project/list`
+- `POST /api/project/import`
+- `POST /api/project/{id}/template`
+- `POST /api/project/{id}/allowed-zone`
+- `POST /api/project/{id}/add-doc`
+- `GET /api/project/{id}/docs`
+- `GET /api/project/{id}/results`
+- `GET /api/project/{id}/export`
+- `DELETE /api/project/{id}/delete`
+- `POST /api/project/{id}/rename`
+- `POST /api/project/{id}/duplicate`
+- `GET /api/project/{id}/status`
+- `DELETE /api/document/{id}`
+- `POST /api/document/{id}/recheck`
+
+## Deploy lên Railway
+
+Repo này đã có sẵn `Dockerfile` và `railway.json`.
+
+Các bước:
+
+1. Push code lên GitHub.
+2. Vào Railway, tạo project mới.
+3. Chọn `Deploy from GitHub repo`.
+4. Chọn đúng repo này.
+5. Railway sẽ tự nhận `Dockerfile` ở thư mục gốc.
+6. Đợi build xong service.
+7. Vào phần `Networking` của service và bấm `Generate Domain`.
+8. Không cần set biến môi trường bắt buộc nếu dùng SQLite local.
+9. Truy cập domain vừa tạo để dùng app.
+
+Lưu ý:
+
+- SQLite sẽ nằm trong container, nên bản free chỉ phù hợp demo hoặc nhóm nhỏ.
+- Nếu cần dữ liệu bền vững hơn trên Railway, nên mount volume hoặc đổi sang managed database.
+- Railway sẽ gọi `/healthz` để health check.
+
+## Ghi chú vận hành
+
+- Link Google Docs phải được share ở chế độ xem được bằng link.
+- Nếu export Google Docs bị chặn, UI sẽ báo để người dùng chuyển sang dán raw text.
+- Nếu `sentence-transformers` chưa tải được model, hệ thống sẽ tự fallback sang `n-gram + LCS`.
+- Dữ liệu lưu trong SQLite tại `data/smart_duplicate.sqlite3`.
+- Stack pinned ở `requirements.txt` nên nên chạy bằng Python `3.11` để khớp môi trường Docker/Railway.

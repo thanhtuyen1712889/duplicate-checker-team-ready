@@ -1,2 +1,15 @@
-psycopg[binary]>=3.2,<4
-openpyxl>=3.1,<4
+fastapi==0.111.0
+uvicorn==0.29.0
+streamlit==1.35.0
+sentence-transformers==2.7.0
+scikit-learn==1.4.2
+pandas==2.2.2
+openpyxl==3.1.2
+nltk==3.8.1
+rapidfuzz==3.9.3
+langdetect==1.0.9
+pyyaml==6.0.1
+requests==2.31.0
+aiohttp==3.9.5
+python-multipart==0.0.9
+spacy==3.7.4
