@@ -92,6 +92,14 @@ if FastAPI is not None:
     async def healthz_head() -> Response:
         return Response(status_code=200)
 
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.head("/health")
+    async def health_head() -> Response:
+        return Response(status_code=200)
+
     @app.post("/api/project/create")
     async def create_project(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         name = (payload.get("name") or "").strip()
