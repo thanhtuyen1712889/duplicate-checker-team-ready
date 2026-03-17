@@ -96,6 +96,8 @@ class Finding:
     exact_span_tokens: int
     excerpt: str
     other_excerpt: str
+    other_section_name: str = ""
+    comparison_scope: str = "same_section"
 
 
 @dataclass
@@ -477,6 +479,79 @@ def tokenize(text: str, *, drop_stopwords: bool = False) -> list[str]:
     if drop_stopwords:
         return [token for token in tokens if token not in STOPWORDS]
     return tokens
+
+
+def semantic_normalize(text: str, template: dict[str, Any]) -> str:
+    normalized = normalize_compact(text)
+    for rule in template.get("semantic_alias_regex", []):
+        if isinstance(rule, dict):
+            pattern = rule.get("pattern", "")
+            replacement = rule.get("replacement", " ")
+        else:
+            pattern, replacement = rule
+        if not pattern:
+            continue
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    return normalize_space(normalized)
+
+
+def stem_token(token: str) -> str:
+    def _stem_simple(value: str) -> str:
+        if len(value) <= 4:
+            return value
+        for suffix in (
+            "ization",
+            "isation",
+            "ational",
+            "fulness",
+            "ousness",
+            "iveness",
+            "ability",
+            "ibility",
+            "ments",
+            "ment",
+            "ingly",
+            "edly",
+            "able",
+            "ible",
+            "tion",
+            "sion",
+            "ance",
+            "ence",
+            "ness",
+            "less",
+            "ship",
+            "ings",
+            "ing",
+            "ers",
+            "ies",
+            "ied",
+            "est",
+            "ism",
+            "ist",
+            "ous",
+            "ive",
+            "ize",
+            "ise",
+            "ed",
+            "er",
+            "ly",
+            "es",
+            "s",
+        ):
+            if value.endswith(suffix) and len(value) - len(suffix) >= 3:
+                if suffix in {"ies", "ied"}:
+                    return value[: -len(suffix)] + "y"
+                return value[: -len(suffix)]
+        return value
+
+    parts = token.split("-")
+    return "-".join(_stem_simple(part) for part in parts if part)
+
+
+def semantic_tokens(text: str, template: dict[str, Any], *, drop_stopwords: bool = True) -> list[str]:
+    tokens = tokenize(semantic_normalize(text, template), drop_stopwords=drop_stopwords)
+    return [stem_token(token) for token in tokens if len(token) > 1]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -1132,7 +1207,7 @@ def compare_section_sets(
         if section.weight <= 0:
             continue
         other_section = other_sections.get(name)
-        if not other_section or not other_section.text:
+        if not other_section:
             continue
         finding = compare_sections(
             section=section,
@@ -1143,6 +1218,21 @@ def compare_section_sets(
         )
         if finding:
             findings.append(finding)
+    for name, section in sections.items():
+        if section.weight <= 0 or not is_cross_section_source(section, template):
+            continue
+        for other_name, other_section in other_sections.items():
+            if other_name == name or not is_cross_section_target(other_section, template):
+                continue
+            finding = compare_sections(
+                section=section,
+                other_section=other_section,
+                template=template,
+                other_row=other_row,
+                embedding_client=embedding_client,
+            )
+            if finding:
+                findings.append(finding)
     return findings
 
 
@@ -1157,12 +1247,6 @@ def compare_sections(
     config = template["sections"].get(section.name, template["sections"]["full_text"])
     if config["mode"] == "ignore":
         return None
-
-    left_text = preprocess_section_text(section, template)
-    right_text = preprocess_section_text(other_section, template)
-    if not left_text or not right_text:
-        return None
-
     if config["mode"] == "faq":
         return compare_faq_sections(
             section=section,
@@ -1173,35 +1257,79 @@ def compare_sections(
             embedding_client=embedding_client,
         )
 
+    left_text = preprocess_section_text(section, template)
+    right_text = preprocess_section_text(other_section, template)
+    if not left_text or not right_text:
+        return None
+
     left_tokens = tokenize(left_text, drop_stopwords=True)
     right_tokens = tokenize(right_text, drop_stopwords=True)
+    left_semantic_tokens = semantic_tokens(left_text, template, drop_stopwords=True)
+    right_semantic_tokens = semantic_tokens(right_text, template, drop_stopwords=True)
     lexical = lexical_similarity(left_tokens, right_tokens)
-    semantic = semantic_similarity(left_text, right_text, left_tokens, right_tokens, embedding_client)
+    semantic = semantic_similarity(
+        left_text,
+        right_text,
+        left_tokens,
+        right_tokens,
+        embedding_client,
+        template,
+    )
+    concept = concept_overlap_score(left_semantic_tokens, right_semantic_tokens)
     longest_exact = exact_token_span(left_tokens, right_tokens)
     window_ratio, excerpt, other_excerpt = best_window_similarity(left_text, right_text)
+    window_semantic, semantic_excerpt, semantic_other_excerpt = best_window_semantic(left_text, right_text, template)
+    profile = scoring_profile(config, template)
+    idea_strength = idea_overlap_strength(semantic, concept, window_semantic)
+    idea_support = max(concept, window_semantic, semantic * 0.9)
 
     risk = 0.0
     rule = ""
-    if longest_exact >= int(config.get("exact_span_tokens", template["global_thresholds"]["exact_span_tokens"])) or window_ratio >= 0.92:
+    if longest_exact >= int(profile["exact_span_tokens"]) or window_ratio >= 0.92:
         risk = 0.95
         rule = "exact_span"
-    if lexical >= template["global_thresholds"]["near_copy_lexical"]:
+    if lexical >= float(profile["near_copy_lexical"]):
         candidate = min(0.85, 0.45 + lexical * 0.5)
         if candidate > risk:
             risk = candidate
             rule = "near_copy"
-    semantic_red = float(config.get("semantic_red", template["global_thresholds"]["semantic_red"]))
-    semantic_yellow = float(config.get("semantic_yellow", template["global_thresholds"]["semantic_yellow"]))
-    if semantic >= semantic_red and lexical >= 0.20:
-        candidate = min(0.92, 0.40 + semantic * 0.6)
+
+    semantic_red = float(profile["semantic_red"])
+    semantic_yellow = float(profile["semantic_yellow"])
+    red_gate = (
+        lexical >= float(profile["semantic_lexical_floor_red"])
+        or idea_strength >= float(profile["idea_overlap_red"])
+        or concept >= float(profile["idea_overlap_red"])
+        or window_semantic >= float(profile["window_semantic_red"])
+    )
+    yellow_gate = (
+        lexical >= float(profile["semantic_lexical_floor_yellow"])
+        or idea_strength >= float(profile["idea_overlap_yellow"])
+        or concept >= float(profile["idea_overlap_yellow"])
+        or window_semantic >= float(profile["window_semantic_yellow"])
+    )
+
+    if semantic >= semantic_red and red_gate:
+        candidate = min(0.93, 0.30 + semantic * 0.38 + concept * 0.18 + window_semantic * 0.18)
         if candidate > risk:
             risk = candidate
-            rule = "semantic_paraphrase"
-    elif semantic >= semantic_yellow and lexical >= 0.15:
-        candidate = min(0.72, 0.30 + semantic * 0.45)
+            rule = "idea_overlap" if lexical < float(profile["near_copy_lexical"]) * 0.55 else "semantic_paraphrase"
+    elif semantic >= semantic_yellow and yellow_gate:
+        candidate = min(0.76, 0.22 + semantic * 0.32 + concept * 0.14 + window_semantic * 0.14)
         if candidate > risk:
             risk = candidate
-            rule = "semantic_overlap"
+            rule = "idea_overlap" if lexical < float(profile["near_copy_lexical"]) * 0.45 else "semantic_overlap"
+
+    if idea_strength >= float(profile["idea_overlap_red"]) and idea_support >= max(0.55, float(profile["idea_overlap_yellow"])):
+        candidate = min(0.88, 0.28 + idea_strength * 0.62 + idea_support * 0.10)
+        if candidate > risk:
+            risk = candidate
+            rule = "idea_overlap"
+    elif idea_strength >= float(profile["idea_overlap_yellow"]) and idea_support >= max(0.45, float(profile["idea_overlap_yellow"]) - 0.05):
+        candidate = min(0.76, 0.20 + idea_strength * 0.52 + idea_support * 0.08)
+        if candidate > risk:
+            risk = candidate
+            rule = "idea_overlap"
 
     fact_ratio = max(fact_heavy_ratio(left_text, template), fact_heavy_ratio(right_text, template))
     if config["mode"] in {"allow_high_overlap", "low_weight"}:
@@ -1212,6 +1340,9 @@ def compare_sections(
     if risk < 0.30:
         return None
     severity = "red" if risk >= 0.75 else "yellow"
+    if rule in {"semantic_paraphrase", "semantic_overlap", "idea_overlap"} and window_semantic >= window_ratio:
+        excerpt = semantic_excerpt
+        other_excerpt = semantic_other_excerpt
     return Finding(
         other_document_id=int(other_row["id"]),
         other_document_key=str(other_row["document_key"]),
@@ -1221,10 +1352,12 @@ def compare_sections(
         severity=severity,
         risk=round(risk, 4),
         lexical_similarity=round(lexical, 4),
-        semantic_similarity=round(semantic, 4),
+        semantic_similarity=round(max(semantic, concept, window_semantic, idea_strength), 4),
         exact_span_tokens=longest_exact,
         excerpt=excerpt,
         other_excerpt=other_excerpt,
+        other_section_name=other_section.name,
+        comparison_scope="cross_section" if section.name != other_section.name else "same_section",
     )
 
 
@@ -1239,36 +1372,98 @@ def compare_faq_sections(
 ) -> Finding | None:
     items = section.metadata.get("items") or []
     other_items = other_section.metadata.get("items") or []
+    profile = scoring_profile(config, template)
     best_finding: Finding | None = None
     for item in items:
         for other_item in other_items:
+            question_left = normalize_space(item.get("question", ""))
+            question_right = normalize_space(other_item.get("question", ""))
+            question_tokens_left = tokenize(question_left, drop_stopwords=True)
+            question_tokens_right = tokenize(question_right, drop_stopwords=True)
             question_similarity = lexical_similarity(
-                tokenize(item.get("question", ""), drop_stopwords=True),
-                tokenize(other_item.get("question", ""), drop_stopwords=True),
+                question_tokens_left,
+                question_tokens_right,
             )
-            answer_left = item.get("answer", "")
-            answer_right = other_item.get("answer", "")
+            question_semantic = semantic_similarity(
+                question_left,
+                question_right,
+                question_tokens_left,
+                question_tokens_right,
+                embedding_client,
+                template,
+            )
+            question_concept = concept_overlap_score(
+                semantic_tokens(question_left, template, drop_stopwords=True),
+                semantic_tokens(question_right, template, drop_stopwords=True),
+            )
+            question_window_semantic, _, _ = best_window_semantic(question_left, question_right, template)
+            question_strength = idea_overlap_strength(question_semantic, question_concept, question_window_semantic)
+            answer_left = normalize_space(item.get("answer", ""))
+            answer_right = normalize_space(other_item.get("answer", ""))
             if not answer_left or not answer_right:
                 continue
             answer_tokens_left = tokenize(answer_left, drop_stopwords=True)
             answer_tokens_right = tokenize(answer_right, drop_stopwords=True)
             lexical = lexical_similarity(answer_tokens_left, answer_tokens_right)
             semantic = semantic_similarity(
-                answer_left, answer_right, answer_tokens_left, answer_tokens_right, embedding_client
+                answer_left,
+                answer_right,
+                answer_tokens_left,
+                answer_tokens_right,
+                embedding_client,
+                template,
             )
+            concept = concept_overlap_score(
+                semantic_tokens(answer_left, template, drop_stopwords=True),
+                semantic_tokens(answer_right, template, drop_stopwords=True),
+            )
+            window_semantic, excerpt, other_excerpt = best_window_semantic(answer_left, answer_right, template)
             longest_exact = exact_token_span(answer_tokens_left, answer_tokens_right)
+            idea_strength = idea_overlap_strength(semantic, concept, window_semantic)
+            idea_support = max(concept, window_semantic, semantic * 0.9)
             risk = 0.0
             rule = ""
-            if question_similarity >= 0.45:
-                if longest_exact >= int(config.get("exact_span_tokens", 24)):
+            question_gate = (
+                question_similarity >= float(profile["question_lexical_gate"])
+                or question_semantic >= float(profile["question_semantic_gate"])
+                or question_concept >= float(profile["question_concept_gate"])
+                or question_strength >= max(
+                    float(profile["question_concept_gate"]) + 0.08,
+                    float(profile["question_semantic_gate"]) - 0.08,
+                )
+            )
+            if question_gate:
+                if longest_exact >= int(profile["exact_span_tokens"]):
                     risk = 0.92
                     rule = "faq_exact_span"
-                if semantic >= float(config.get("semantic_red", 0.87)):
-                    risk = max(risk, 0.85)
+                red_gate = (
+                    lexical >= float(profile["semantic_lexical_floor_red"])
+                    or idea_strength >= float(profile["idea_overlap_red"])
+                    or concept >= float(profile["idea_overlap_red"])
+                    or window_semantic >= float(profile["window_semantic_red"])
+                )
+                yellow_gate = (
+                    lexical >= float(profile["semantic_lexical_floor_yellow"])
+                    or idea_strength >= float(profile["idea_overlap_yellow"])
+                    or concept >= float(profile["idea_overlap_yellow"])
+                    or window_semantic >= float(profile["window_semantic_yellow"])
+                )
+                if semantic >= float(profile["semantic_red"]) and red_gate:
+                    risk = max(risk, 0.87)
                     rule = rule or "faq_intent_overlap"
-                elif semantic >= float(config.get("semantic_yellow", 0.82)):
-                    risk = max(risk, 0.68)
+                elif semantic >= float(profile["semantic_yellow"]) and yellow_gate:
+                    risk = max(risk, 0.70)
                     rule = rule or "faq_intent_overlap"
+                elif idea_strength >= float(profile["idea_overlap_red"]) and idea_support >= max(
+                    0.55, float(profile["idea_overlap_yellow"])
+                ):
+                    risk = max(risk, min(0.88, 0.26 + idea_strength * 0.64 + idea_support * 0.10))
+                    rule = rule or "faq_idea_overlap"
+                elif idea_strength >= float(profile["idea_overlap_yellow"]) and idea_support >= max(
+                    0.45, float(profile["idea_overlap_yellow"]) - 0.05
+                ):
+                    risk = max(risk, min(0.76, 0.22 + idea_strength * 0.54 + idea_support * 0.08))
+                    rule = rule or "faq_idea_overlap"
             if risk < 0.30:
                 continue
             severity = "red" if risk >= 0.75 else "yellow"
@@ -1281,10 +1476,24 @@ def compare_faq_sections(
                 severity=severity,
                 risk=round(risk, 4),
                 lexical_similarity=round(lexical, 4),
-                semantic_similarity=round(semantic, 4),
+                semantic_similarity=round(
+                    max(
+                        semantic,
+                        concept,
+                        question_semantic,
+                        question_concept,
+                        question_window_semantic,
+                        window_semantic,
+                        idea_strength,
+                        question_strength,
+                    ),
+                    4,
+                ),
                 exact_span_tokens=longest_exact,
-                excerpt=normalize_space(answer_left)[:240],
-                other_excerpt=normalize_space(answer_right)[:240],
+                excerpt=excerpt[:240],
+                other_excerpt=other_excerpt[:240],
+                other_section_name=other_section.name,
+                comparison_scope="cross_section" if section.name != other_section.name else "same_section",
             )
             if not best_finding or candidate.risk > best_finding.risk:
                 best_finding = candidate
@@ -1292,7 +1501,7 @@ def compare_faq_sections(
 
 
 def preprocess_section_text(section: Section, template: dict[str, Any]) -> str:
-    text = section.text or ""
+    text = comparable_section_text(section)
     for pattern in template.get("approved_reuse_regex", []):
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     text = normalize_space(text)
@@ -1300,6 +1509,74 @@ def preprocess_section_text(section: Section, template: dict[str, Any]) -> str:
         text = re.sub(r"\bfor professional takeaway and delivery\b", " ", text, flags=re.IGNORECASE)
         text = normalize_space(text)
     return text
+
+
+def comparable_section_text(section: Section) -> str:
+    text = normalize_space(section.text or "")
+    if text:
+        return text
+    items = section.metadata.get("items") or []
+    if not items:
+        return ""
+    parts: list[str] = []
+    for item in items:
+        question = normalize_space(str(item.get("question", "")))
+        answer = normalize_space(str(item.get("answer", "")))
+        if question and answer:
+            parts.append(f"{question} {answer}")
+        elif question:
+            parts.append(question)
+        elif answer:
+            parts.append(answer)
+    return normalize_space("\n\n".join(parts))
+
+
+def is_cross_section_source(section: Section, template: dict[str, Any]) -> bool:
+    config = template["sections"].get(section.name, template["sections"]["full_text"])
+    return bool(config.get("cross_check_source"))
+
+
+def is_cross_section_target(section: Section, template: dict[str, Any]) -> bool:
+    config = template["sections"].get(section.name, template["sections"]["full_text"])
+    return bool(config.get("cross_check_target")) and bool(comparable_section_text(section))
+
+
+def scoring_profile(config: dict[str, Any], template: dict[str, Any]) -> dict[str, float]:
+    thresholds = template["global_thresholds"]
+    profile = {
+        "exact_span_tokens": float(config.get("exact_span_tokens", thresholds["exact_span_tokens"])),
+        "near_copy_lexical": float(thresholds["near_copy_lexical"]),
+        "semantic_yellow": float(config.get("semantic_yellow", thresholds["semantic_yellow"])),
+        "semantic_red": float(config.get("semantic_red", thresholds["semantic_red"])),
+        "idea_overlap_yellow": float(config.get("idea_overlap_yellow", thresholds.get("idea_overlap_yellow", 0.55))),
+        "idea_overlap_red": float(config.get("idea_overlap_red", thresholds.get("idea_overlap_red", 0.65))),
+        "window_semantic_yellow": float(config.get("window_semantic_yellow", thresholds.get("window_semantic_yellow", 0.70))),
+        "window_semantic_red": float(config.get("window_semantic_red", thresholds.get("window_semantic_red", 0.80))),
+        "semantic_lexical_floor_yellow": float(
+            config.get("semantic_lexical_floor_yellow", thresholds.get("semantic_lexical_floor_yellow", 0.08))
+        ),
+        "semantic_lexical_floor_red": float(
+            config.get("semantic_lexical_floor_red", thresholds.get("semantic_lexical_floor_red", 0.10))
+        ),
+        "question_lexical_gate": float(config.get("question_lexical_gate", thresholds.get("question_lexical_gate", 0.30))),
+        "question_semantic_gate": float(config.get("question_semantic_gate", thresholds.get("question_semantic_gate", 0.72))),
+        "question_concept_gate": float(config.get("question_concept_gate", thresholds.get("question_concept_gate", 0.48))),
+    }
+    mode = config.get("mode", "mixed")
+    if mode == "strict":
+        profile["semantic_lexical_floor_yellow"] = min(profile["semantic_lexical_floor_yellow"], 0.05)
+        profile["semantic_lexical_floor_red"] = min(profile["semantic_lexical_floor_red"], 0.08)
+        profile["idea_overlap_yellow"] = min(profile["idea_overlap_yellow"], 0.50)
+        profile["idea_overlap_red"] = min(profile["idea_overlap_red"], 0.60)
+    elif mode == "faq":
+        profile["semantic_lexical_floor_yellow"] = min(profile["semantic_lexical_floor_yellow"], 0.05)
+        profile["semantic_lexical_floor_red"] = min(profile["semantic_lexical_floor_red"], 0.08)
+        profile["idea_overlap_yellow"] = min(profile["idea_overlap_yellow"], 0.50)
+        profile["idea_overlap_red"] = min(profile["idea_overlap_red"], 0.60)
+    elif mode == "mixed":
+        profile["semantic_lexical_floor_yellow"] = min(profile["semantic_lexical_floor_yellow"], 0.08)
+        profile["semantic_lexical_floor_red"] = min(profile["semantic_lexical_floor_red"], 0.10)
+    return profile
 
 
 def lexical_similarity(tokens_a: list[str], tokens_b: list[str]) -> float:
@@ -1316,34 +1593,56 @@ def semantic_similarity(
     tokens_a: list[str],
     tokens_b: list[str],
     embedding_client: OptionalEmbeddingClient,
+    template: dict[str, Any],
 ) -> float:
+    semantic_tokens_a = semantic_tokens(text_a, template, drop_stopwords=True)
+    semantic_tokens_b = semantic_tokens(text_b, template, drop_stopwords=True)
+    tf_cosine = cosine_from_maps(term_frequency(semantic_tokens_a), term_frequency(semantic_tokens_b))
+    sentence_cosine = best_sentence_semantic(text_a, text_b, template)
+    window_cosine, _, _ = best_window_semantic(text_a, text_b, template)
+    concept_score = concept_overlap_score(semantic_tokens_a, semantic_tokens_b)
+    local_semantic = round(
+        (tf_cosine * 0.35) + (sentence_cosine * 0.20) + (window_cosine * 0.25) + (concept_score * 0.20),
+        4,
+    )
     embedding_score = None
     if embedding_client.available() and (len(tokens_a) + len(tokens_b) >= 12):
         embedding_score = embedding_client.similarity(text_a, text_b)
     if embedding_score is not None:
-        return max(0.0, min(1.0, float(embedding_score)))
-    tf_cosine = cosine_from_maps(term_frequency(tokens_a), term_frequency(tokens_b))
-    sentence_cosine = best_sentence_semantic(text_a, text_b)
-    return round((tf_cosine * 0.55) + (sentence_cosine * 0.45), 4)
+        combined = (float(embedding_score) * 0.70) + (local_semantic * 0.30)
+        return max(0.0, min(1.0, combined))
+    return local_semantic
 
 
-def best_sentence_semantic(text_a: str, text_b: str) -> float:
+def best_sentence_semantic(text_a: str, text_b: str, template: dict[str, Any]) -> float:
     left_sentences = split_sentences(text_a)
     right_sentences = split_sentences(text_b)
     best = 0.0
     for left in left_sentences:
-        left_tokens = tokenize(left, drop_stopwords=True)
+        left_tokens = semantic_tokens(left, template, drop_stopwords=True)
         if not left_tokens:
             continue
         left_tf = term_frequency(left_tokens)
         for right in right_sentences:
-            right_tokens = tokenize(right, drop_stopwords=True)
+            right_tokens = semantic_tokens(right, template, drop_stopwords=True)
             if not right_tokens:
                 continue
             score = cosine_from_maps(left_tf, term_frequency(right_tokens))
             if score > best:
                 best = score
     return best
+
+
+def concept_overlap_score(tokens_a: list[str], tokens_b: list[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    token_jaccard = jaccard(set(tokens_a), set(tokens_b))
+    token_cosine = cosine_from_maps(term_frequency(tokens_a), term_frequency(tokens_b))
+    return round((token_jaccard * 0.45) + (token_cosine * 0.55), 4)
+
+
+def idea_overlap_strength(semantic: float, concept: float, window_semantic: float) -> float:
+    return round((semantic * 0.40) + (concept * 0.35) + (window_semantic * 0.25), 4)
 
 
 def exact_token_span(tokens_a: list[str], tokens_b: list[str]) -> int:
@@ -1371,6 +1670,35 @@ def best_window_similarity(text_a: str, text_b: str) -> tuple[float, str, str]:
                     best_left = left[:240]
                     best_right = right[:240]
     return best_ratio, best_left, best_right
+
+
+def best_window_semantic(text_a: str, text_b: str, template: dict[str, Any]) -> tuple[float, str, str]:
+    left_sentences = split_sentences(text_a)
+    right_sentences = split_sentences(text_b)
+    best_score = 0.0
+    best_left = normalize_space(text_a)[:240]
+    best_right = normalize_space(text_b)[:240]
+    for window in (4, 3, 2, 1):
+        left_windows = sentence_windows(left_sentences, window)
+        right_windows = sentence_windows(right_sentences, window)
+        for left in left_windows:
+            left_tokens = semantic_tokens(left, template, drop_stopwords=True)
+            if not left_tokens:
+                continue
+            left_tf = term_frequency(left_tokens)
+            left_set = set(left_tokens)
+            for right in right_windows:
+                right_tokens = semantic_tokens(right, template, drop_stopwords=True)
+                if not right_tokens:
+                    continue
+                score = (cosine_from_maps(left_tf, term_frequency(right_tokens)) * 0.6) + (
+                    jaccard(left_set, set(right_tokens)) * 0.4
+                )
+                if score > best_score:
+                    best_score = score
+                    best_left = left[:240]
+                    best_right = right[:240]
+    return round(best_score, 4), best_left, best_right
 
 
 def fact_heavy_ratio(text: str, template: dict[str, Any]) -> float:

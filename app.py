@@ -497,11 +497,18 @@ def render_document(document_id: int) -> str:
     section_risks = parsed.get("section_risks", {})
     finding_cards = []
     for finding in findings[:12]:
+        current_section = escape(finding.get("section_name", ""))
+        other_section = escape(finding.get("other_section_name", ""))
+        scope = escape(finding.get("comparison_scope", "same_section"))
+        section_label = current_section
+        if scope == "cross_section" and other_section and other_section != current_section:
+            section_label = f"{current_section} -> {other_section}"
         finding_cards.append(
             f"""
             <article class="finding {escape(finding['severity'])}">
               <div class="finding-head">
-                <strong>{escape(finding['section_name'])}</strong>
+                <strong>{section_label}</strong>
+                <span class="pill">{scope}</span>
                 <span class="pill">{escape(finding['rule'])}</span>
                 <span class="pill">{finding['risk'] * 100:.1f}% risk</span>
                 <a href="/document?id={int(finding['other_document_id'])}">so voi {escape(finding['other_display_name'])}</a>
