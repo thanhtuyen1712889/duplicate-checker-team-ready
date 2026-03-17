@@ -9,14 +9,11 @@ COPY requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m spacy download en_core_web_sm \
-    && python - <<'PY'
-import nltk
-nltk.download("punkt")
-PY
+    && python -m nltk.downloader punkt
 
 COPY app.py /app/app.py
 COPY smart_duplicate_core.py /app/smart_duplicate_core.py
+COPY README.md /app/README.md
 
 RUN mkdir -p /app/data
 
