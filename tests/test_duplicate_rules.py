@@ -228,6 +228,114 @@ class DuplicateRuleTests(unittest.TestCase):
         self.assertEqual(finding.other_section_name, "intro")
         self.assertIn(finding.rule, {"idea_overlap", "semantic_paraphrase", "semantic_overlap"})
 
+    def test_faq_skips_short_yes_opener_in_excerpt(self) -> None:
+        left = Section(
+            name="faq",
+            text="",
+            heading="Frequently Asked Questions",
+            mode="faq",
+            weight=0.9,
+            metadata={
+                "items": [
+                    {
+                        "question": "Can these containers be used for warm takeaway meals?",
+                        "answer": "Yes. They work well for hot food to go, and the secure seal helps keep the contents protected during delivery.",
+                    }
+                ]
+            },
+        )
+        right = Section(
+            name="faq",
+            text="",
+            heading="Frequently Asked Questions",
+            mode="faq",
+            weight=0.9,
+            metadata={
+                "items": [
+                    {
+                        "question": "Are they suitable for hot food on the go?",
+                        "answer": "Yes. They are a good choice for warm takeaway dishes, and the tight lid keeps the food secure in transit.",
+                    }
+                ]
+            },
+        )
+
+        finding = compare_sections(
+            section=left,
+            other_section=right,
+            template=self.template,
+            other_row=other_row(),
+            embedding_client=self.embedding_client,
+        )
+
+        self.assertIsNotNone(finding)
+        assert finding is not None
+        self.assertNotEqual(finding.excerpt, "Yes.")
+        self.assertNotEqual(finding.other_excerpt, "Yes.")
+
+    def test_use_case_generic_framing_only_is_softened(self) -> None:
+        left = make_section(
+            "use_cases",
+            "The following scenarios illustrate situations where the 900ml bowl format fits typical foodservice operations.",
+            self.template,
+        )
+        right = make_section(
+            "use_cases",
+            "The following scenarios illustrate how the 183mm PP lid fits into professional foodservice workflows.",
+            self.template,
+        )
+
+        finding = compare_sections(
+            section=left,
+            other_section=right,
+            template=self.template,
+            other_row=other_row(),
+            embedding_client=self.embedding_client,
+        )
+
+        self.assertIsNone(finding)
+
+    def test_use_case_exact_duplicate_framing_still_flags(self) -> None:
+        text = "The following scenarios illustrate situations where the 900ml bowl format fits typical foodservice operations."
+        left = make_section("use_cases", text, self.template)
+        right = make_section("use_cases", text, self.template)
+
+        finding = compare_sections(
+            section=left,
+            other_section=right,
+            template=self.template,
+            other_row=other_row(),
+            embedding_client=self.embedding_client,
+        )
+
+        self.assertIsNotNone(finding)
+        assert finding is not None
+        self.assertIn(finding.rule, {"exact_span", "near_copy", "semantic_overlap", "idea_overlap"})
+
+    def test_capacity_fit_overlap_gets_reason_label(self) -> None:
+        left = make_section(
+            "use_cases",
+            "The 900ml bowl provides enough internal volume to accommodate these elements without overfilling the container before lid closure.",
+            self.template,
+        )
+        right = make_section(
+            "use_cases",
+            "A 12oz bowl provides sufficient space for these supplementary portions without using containers intended for full meals.",
+            self.template,
+        )
+
+        finding = compare_sections(
+            section=left,
+            other_section=right,
+            template=self.template,
+            other_row=other_row(),
+            embedding_client=self.embedding_client,
+        )
+
+        self.assertIsNotNone(finding)
+        assert finding is not None
+        self.assertEqual(finding.reason_label, "same capacity-fit idea")
+
 
 if __name__ == "__main__":
     unittest.main()

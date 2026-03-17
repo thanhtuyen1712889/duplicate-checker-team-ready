@@ -57,11 +57,52 @@ STOPWORDS = {
     "or",
     "that",
     "the",
+    "they",
+    "them",
     "their",
     "this",
     "to",
     "with",
+    "can",
 }
+LOW_SIGNAL_STEMS = {
+    "fit-for",
+    "pack-unit",
+    "serv",
+    "these",
+    "this",
+    "that",
+    "those",
+    "mak",
+    "keep",
+    "help",
+    "work",
+    "use",
+    "provid",
+    "illustrat",
+    "scenar",
+    "situation",
+    "typic",
+    "profession",
+    "workflow",
+    "foodservic",
+    "without",
+}
+FAQ_SHORT_ACK_RE = re.compile(
+    r"^\s*(yes|no|certainly|of course|absolutely|indeed|sure|okay|ok)\s*[.!?]+\s*",
+    re.IGNORECASE,
+)
+GENERIC_FRAMING_PATTERNS = [
+    re.compile(r"\bthe following (scenarios|examples) illustrate\b", re.IGNORECASE),
+    re.compile(r"\bthe examples below show\b", re.IGNORECASE),
+    re.compile(r"\bthis section (outlines|shows|illustrates)\b", re.IGNORECASE),
+    re.compile(r"\btypical foodservice (operations|workflows)\b", re.IGNORECASE),
+]
+CAPACITY_SIGNAL_STEMS = {"space", "volum", "capacity", "capacity-fit", "overfill", "enough", "suffici", "accommodat"}
+DELIVERY_SIGNAL_STEMS = {"takeaway-delivery", "leak-resistant", "secure-closure", "transit", "delivery", "spill", "leak"}
+STACKING_SIGNAL_STEMS = {"stackable", "storage-space", "stack", "lightweight"}
+VISIBILITY_SIGNAL_STEMS = {"clear-visibility", "deli-display", "display", "transparent"}
+FRAMING_SIGNAL_STEMS = {"lunch-service", "workflow", "scenar", "illustrat", "operation"}
 
 
 @dataclass
@@ -98,6 +139,10 @@ class Finding:
     other_excerpt: str
     other_section_name: str = ""
     comparison_scope: str = "same_section"
+    other_source_name: str = ""
+    reason_label: str = ""
+    current_highlight_terms: list[str] = field(default_factory=list)
+    other_highlight_terms: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -552,6 +597,120 @@ def stem_token(token: str) -> str:
 def semantic_tokens(text: str, template: dict[str, Any], *, drop_stopwords: bool = True) -> list[str]:
     tokens = tokenize(semantic_normalize(text, template), drop_stopwords=drop_stopwords)
     return [stem_token(token) for token in tokens if len(token) > 1]
+
+
+def trim_short_faq_opener(text: str) -> str:
+    trimmed = FAQ_SHORT_ACK_RE.sub("", text or "", count=1)
+    return normalize_space(trimmed)
+
+
+def informative_signal_stems(text: str, template: dict[str, Any]) -> set[str]:
+    return {
+        token
+        for token in semantic_tokens(text, template, drop_stopwords=True)
+        if token not in LOW_SIGNAL_STEMS and len(token) >= 4
+    }
+
+
+def informative_token_count(text: str, template: dict[str, Any]) -> int:
+    return len(informative_signal_stems(text, template))
+
+
+def best_informative_excerpt(text: str, template: dict[str, Any]) -> str:
+    normalized = normalize_space(text)
+    if not normalized:
+        return ""
+    sentences = split_sentences(normalized)
+    best_excerpt = normalized[:240]
+    best_score = informative_token_count(best_excerpt, template)
+    for window in (3, 2, 1):
+        for candidate in sentence_windows(sentences, window):
+            score = informative_token_count(candidate, template)
+            if score > best_score:
+                best_score = score
+                best_excerpt = candidate[:240]
+    return normalize_space(best_excerpt)
+
+
+def choose_display_excerpt(candidate: str, full_text: str, template: dict[str, Any]) -> str:
+    normalized_candidate = normalize_space(candidate)
+    if informative_token_count(normalized_candidate, template) >= 4:
+        return normalized_candidate[:240]
+    informative_excerpt = best_informative_excerpt(full_text, template)
+    if informative_token_count(informative_excerpt, template) >= 4:
+        return informative_excerpt[:240]
+    return normalized_candidate[:240] or normalize_space(full_text)[:240]
+
+
+def looks_like_generic_framing(text: str) -> bool:
+    normalized = normalize_compact(text)
+    return any(pattern.search(normalized) for pattern in GENERIC_FRAMING_PATTERNS)
+
+
+def shared_signal_stems(text_a: str, text_b: str, template: dict[str, Any]) -> set[str]:
+    return informative_signal_stems(text_a, template) & informative_signal_stems(text_b, template)
+
+
+def highlight_terms_for_text(text: str, template: dict[str, Any], shared_stems: set[str], *, limit: int = 6) -> list[str]:
+    if not shared_stems:
+        return []
+    seen: set[str] = set()
+    terms: list[str] = []
+
+    def add(raw: str) -> None:
+        lowered = raw.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        terms.append(raw)
+
+    for raw in WORD_RE.findall(text):
+        stem = stem_token(raw.lower())
+        if stem in shared_stems and stem not in LOW_SIGNAL_STEMS:
+            add(raw)
+        if len(terms) >= limit:
+            return terms
+
+    normalized = normalize_space(text)
+    fallback_patterns: list[str] = []
+    if "secure-closure" in shared_stems:
+        fallback_patterns.append(r"\b(secure|tight|snug|seal|closure|lid)\b")
+    if "takeaway-delivery" in shared_stems:
+        fallback_patterns.append(r"\b(takeaway|delivery|to-go|transit|go)\b")
+    if "leak-resistant" in shared_stems:
+        fallback_patterns.append(r"\b(leak|leaks|spill|spills)\b")
+    if "capacity-fit" in shared_stems or CAPACITY_SIGNAL_STEMS & shared_stems:
+        fallback_patterns.append(r"\b(volume|space|capacity|accommodate|fit|enough|sufficient)\b")
+    if "clear-visibility" in shared_stems:
+        fallback_patterns.append(r"\b(clear|transparent|display|show|showcase|present)\b")
+    if "stackable" in shared_stems or "storage-space" in shared_stems:
+        fallback_patterns.append(r"\b(stack|stackable|storage|space|light|lightweight)\b")
+    for pattern in fallback_patterns:
+        for match in re.finditer(pattern, normalized, re.IGNORECASE):
+            add(match.group(0))
+            if len(terms) >= limit:
+                return terms
+    return terms
+
+
+def reason_label_for_overlap(section_name: str, rule: str, shared_stems: set[str]) -> str:
+    if section_name == "faq":
+        if shared_stems & DELIVERY_SIGNAL_STEMS:
+            return "same delivery-safe faq"
+        return "same faq answer intent"
+    if shared_stems & CAPACITY_SIGNAL_STEMS:
+        return "same capacity-fit idea"
+    if shared_stems & DELIVERY_SIGNAL_STEMS:
+        return "same delivery-safe claim"
+    if shared_stems & STACKING_SIGNAL_STEMS:
+        return "same storage/stacking angle"
+    if shared_stems & VISIBILITY_SIGNAL_STEMS:
+        return "same visibility/display angle"
+    if section_name == "use_cases" or shared_stems & FRAMING_SIGNAL_STEMS:
+        return "same use-case framing"
+    if rule in {"near_copy", "exact_span"}:
+        return "same duplicate expression"
+    return "same product-fit idea"
 
 
 def split_sentences(text: str) -> list[str]:
@@ -1336,6 +1495,13 @@ def compare_sections(
         risk *= 0.35
     elif config["mode"] == "mixed" and fact_ratio >= template["global_thresholds"]["fact_heavy_ratio"]:
         risk *= 0.65
+    if (
+        section.name in {"use_cases", "conclusion", "full_text"}
+        and rule in {"idea_overlap", "semantic_overlap"}
+        and looks_like_generic_framing(excerpt)
+        and looks_like_generic_framing(other_excerpt)
+    ):
+        risk *= 0.52
 
     if risk < 0.30:
         return None
@@ -1343,6 +1509,12 @@ def compare_sections(
     if rule in {"semantic_paraphrase", "semantic_overlap", "idea_overlap"} and window_semantic >= window_ratio:
         excerpt = semantic_excerpt
         other_excerpt = semantic_other_excerpt
+    excerpt = choose_display_excerpt(excerpt, left_text, template)
+    other_excerpt = choose_display_excerpt(other_excerpt, right_text, template)
+    shared_stems = shared_signal_stems(excerpt, other_excerpt, template) or shared_signal_stems(left_text, right_text, template)
+    reason_label = reason_label_for_overlap(section.name, rule or "overlap", shared_stems)
+    current_terms = highlight_terms_for_text(excerpt, template, shared_stems)
+    other_terms = highlight_terms_for_text(other_excerpt, template, shared_stems)
     return Finding(
         other_document_id=int(other_row["id"]),
         other_document_key=str(other_row["document_key"]),
@@ -1358,6 +1530,10 @@ def compare_sections(
         other_excerpt=other_excerpt,
         other_section_name=other_section.name,
         comparison_scope="cross_section" if section.name != other_section.name else "same_section",
+        other_source_name=str(other_row["source_name"]) if "source_name" in other_row.keys() else "",
+        reason_label=reason_label,
+        current_highlight_terms=current_terms,
+        other_highlight_terms=other_terms,
     )
 
 
@@ -1398,8 +1574,8 @@ def compare_faq_sections(
             )
             question_window_semantic, _, _ = best_window_semantic(question_left, question_right, template)
             question_strength = idea_overlap_strength(question_semantic, question_concept, question_window_semantic)
-            answer_left = normalize_space(item.get("answer", ""))
-            answer_right = normalize_space(other_item.get("answer", ""))
+            answer_left = trim_short_faq_opener(item.get("answer", ""))
+            answer_right = trim_short_faq_opener(other_item.get("answer", ""))
             if not answer_left or not answer_right:
                 continue
             answer_tokens_left = tokenize(answer_left, drop_stopwords=True)
@@ -1467,6 +1643,14 @@ def compare_faq_sections(
             if risk < 0.30:
                 continue
             severity = "red" if risk >= 0.75 else "yellow"
+            excerpt = choose_display_excerpt(excerpt, answer_left, template)
+            other_excerpt = choose_display_excerpt(other_excerpt, answer_right, template)
+            shared_stems = shared_signal_stems(excerpt, other_excerpt, template) or shared_signal_stems(
+                answer_left, answer_right, template
+            )
+            reason_label = reason_label_for_overlap(section.name, rule or "faq_overlap", shared_stems)
+            current_terms = highlight_terms_for_text(excerpt, template, shared_stems)
+            other_terms = highlight_terms_for_text(other_excerpt, template, shared_stems)
             candidate = Finding(
                 other_document_id=int(other_row["id"]),
                 other_document_key=str(other_row["document_key"]),
@@ -1494,6 +1678,10 @@ def compare_faq_sections(
                 other_excerpt=other_excerpt[:240],
                 other_section_name=other_section.name,
                 comparison_scope="cross_section" if section.name != other_section.name else "same_section",
+                other_source_name=str(other_row["source_name"]) if "source_name" in other_row.keys() else "",
+                reason_label=reason_label,
+                current_highlight_terms=current_terms,
+                other_highlight_terms=other_terms,
             )
             if not best_finding or candidate.risk > best_finding.risk:
                 best_finding = candidate
@@ -1566,8 +1754,8 @@ def scoring_profile(config: dict[str, Any], template: dict[str, Any]) -> dict[st
     if mode == "strict":
         profile["semantic_lexical_floor_yellow"] = min(profile["semantic_lexical_floor_yellow"], 0.05)
         profile["semantic_lexical_floor_red"] = min(profile["semantic_lexical_floor_red"], 0.08)
-        profile["idea_overlap_yellow"] = min(profile["idea_overlap_yellow"], 0.50)
-        profile["idea_overlap_red"] = min(profile["idea_overlap_red"], 0.60)
+        profile["idea_overlap_yellow"] = min(profile["idea_overlap_yellow"], 0.48)
+        profile["idea_overlap_red"] = min(profile["idea_overlap_red"], 0.58)
     elif mode == "faq":
         profile["semantic_lexical_floor_yellow"] = min(profile["semantic_lexical_floor_yellow"], 0.05)
         profile["semantic_lexical_floor_red"] = min(profile["semantic_lexical_floor_red"], 0.08)

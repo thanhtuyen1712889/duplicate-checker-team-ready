@@ -10,6 +10,7 @@ import html
 import io
 import json
 import os
+import re
 import sys
 import traceback
 from email.parser import BytesParser
@@ -495,6 +496,7 @@ def render_document(document_id: int) -> str:
     findings = parsed.get("findings", [])
     sections = parsed.get("sections", {})
     section_risks = parsed.get("section_risks", {})
+    hotspot_cards = render_hotspot_cards(findings)
     finding_cards = []
     for finding in findings[:12]:
         current_section = escape(finding.get("section_name", ""))
@@ -503,24 +505,42 @@ def render_document(document_id: int) -> str:
         section_label = current_section
         if scope == "cross_section" and other_section and other_section != current_section:
             section_label = f"{current_section} -> {other_section}"
+        reason_label = escape(finding.get("reason_label") or finding.get("rule", "overlap"))
+        source_label = escape(finding.get("other_display_name", ""))
+        source_section = escape(finding.get("other_section_name", ""))
+        current_excerpt_html = render_highlighted_excerpt(
+            finding.get("excerpt", ""),
+            finding.get("current_highlight_terms", []),
+            variant="current",
+        )
+        other_excerpt_html = render_highlighted_excerpt(
+            finding.get("other_excerpt", ""),
+            finding.get("other_highlight_terms", []),
+            variant="other",
+        )
         finding_cards.append(
             f"""
             <article class="finding {escape(finding['severity'])}">
               <div class="finding-head">
                 <strong>{section_label}</strong>
                 <span class="pill">{scope}</span>
-                <span class="pill">{escape(finding['rule'])}</span>
+                <span class="pill reason">{reason_label}</span>
                 <span class="pill">{finding['risk'] * 100:.1f}% risk</span>
                 <a href="/document?id={int(finding['other_document_id'])}">so voi {escape(finding['other_display_name'])}</a>
+              </div>
+              <div class="finding-source">
+                <span><strong>Nguon overlap:</strong> {source_label}</span>
+                <span><strong>Section:</strong> {source_section or "-"}</span>
+                <a class="button secondary small" href="/document?id={int(finding['other_document_id'])}">Mo bai nguon</a>
               </div>
               <div class="grid2">
                 <div>
                   <h4>Doan hien tai</h4>
-                  <pre>{escape(finding['excerpt'])}</pre>
+                  <pre>{current_excerpt_html}</pre>
                 </div>
                 <div>
                   <h4>Doan bi giong</h4>
-                  <pre>{escape(finding['other_excerpt'])}</pre>
+                  <pre>{other_excerpt_html}</pre>
                 </div>
               </div>
             </article>
@@ -562,6 +582,7 @@ def render_document(document_id: int) -> str:
         </section>
         <section class="card">
           <h2>Canh Bao Chinh</h2>
+          {hotspot_cards}
           {''.join(finding_cards)}
         </section>
         <section class="card">
@@ -638,6 +659,80 @@ def render_strategy_options(strategies: list[dict[str, str]]) -> str:
         f'<option value="{escape(strategy["id"])}">{escape(strategy["name"])}</option>'
         for strategy in strategies
     )
+
+
+def render_highlighted_excerpt(text: str, terms: list[str], *, variant: str) -> str:
+    if not text:
+        return ""
+    unique_terms = []
+    seen = set()
+    for term in terms:
+        lowered = str(term).lower()
+        if not lowered or lowered in seen:
+            continue
+        seen.add(lowered)
+        unique_terms.append(str(term))
+    if not unique_terms:
+        return escape(text)
+    pattern = re.compile("|".join(re.escape(term) for term in sorted(unique_terms, key=len, reverse=True)), re.IGNORECASE)
+    parts = []
+    cursor = 0
+    for match in pattern.finditer(text):
+        parts.append(escape(text[cursor:match.start()]))
+        parts.append(f'<mark class="overlap-{variant}">{escape(match.group(0))}</mark>')
+        cursor = match.end()
+    parts.append(escape(text[cursor:]))
+    return "".join(parts)
+
+
+def render_hotspot_cards(findings: list[dict]) -> str:
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    for finding in findings:
+        section = str(finding.get("section_name", ""))
+        reason = str(finding.get("reason_label") or finding.get("rule", "overlap"))
+        key = (section, reason)
+        group = groups.setdefault(
+            key,
+            {
+                "section": section,
+                "reason": reason,
+                "max_risk": 0.0,
+                "sources": [],
+            },
+        )
+        group["max_risk"] = max(float(group["max_risk"]), float(finding.get("risk", 0.0)))
+        source_tuple = (
+            int(finding.get("other_document_id", 0)),
+            str(finding.get("other_display_name", "")),
+            str(finding.get("other_section_name", "")),
+        )
+        if source_tuple not in group["sources"]:
+            group["sources"].append(source_tuple)
+    if not groups:
+        return ""
+    cards = []
+    ordered = sorted(
+        groups.values(),
+        key=lambda item: (len(item["sources"]), float(item["max_risk"])),
+        reverse=True,
+    )[:6]
+    for item in ordered:
+        severity = "red" if float(item["max_risk"]) >= 0.75 else "yellow"
+        sources = item["sources"][:3]
+        links = " ".join(
+            f'<a href="/document?id={doc_id}">{escape(name)}</a><span class="hotspot-meta">/{escape(section or "-")}</span>'
+            for doc_id, name, section in sources
+        )
+        cards.append(
+            f"""
+            <article class="hotspot {severity}">
+              <strong>{escape(item['reason'])}</strong>
+              <span>{escape(item['section'])} lap voi {len(item['sources'])} bai | max {float(item['max_risk']) * 100:.1f}% risk</span>
+              <div class="hotspot-links">{links}</div>
+            </article>
+            """
+        )
+    return f'<div class="hotspot-grid">{"".join(cards)}</div>'
 
 
 def render_flash(message: str, *, kind: str) -> str:
@@ -787,6 +882,10 @@ def page(*, title: str, current_nav: str, body: str) -> str:
           color: var(--accent);
           border: 1px solid rgba(15, 92, 115, 0.16);
         }}
+        .button.small {{
+          padding: 8px 12px;
+          font-size: 12px;
+        }}
         .filters {{
           display: grid;
           gap: 12px;
@@ -891,12 +990,59 @@ def page(*, title: str, current_nav: str, body: str) -> str:
           align-items: center;
           margin-bottom: 12px;
         }}
+        .finding-source {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-items: center;
+          margin-bottom: 12px;
+          color: var(--muted);
+          font-size: 13px;
+        }}
         .pill {{
           padding: 4px 9px;
           border-radius: 999px;
           background: rgba(15, 92, 115, 0.08);
           color: var(--accent);
           font-size: 12px;
+        }}
+        .pill.reason {{
+          background: rgba(185, 128, 20, 0.12);
+          color: var(--yellow);
+        }}
+        .hotspot-grid {{
+          display: grid;
+          gap: 12px;
+          grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+          margin-bottom: 16px;
+        }}
+        .hotspot {{
+          padding: 14px;
+          border-radius: 14px;
+          border: 1px solid var(--line);
+          background: #fcfaf6;
+        }}
+        .hotspot.red {{ border-color: rgba(179, 58, 48, 0.35); }}
+        .hotspot.yellow {{ border-color: rgba(185, 128, 20, 0.35); }}
+        .hotspot strong {{
+          display: block;
+          margin-bottom: 6px;
+        }}
+        .hotspot span {{
+          display: block;
+          color: var(--muted);
+          font-size: 13px;
+          line-height: 1.5;
+        }}
+        .hotspot-links {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-top: 8px;
+          font-size: 13px;
+        }}
+        .hotspot-meta {{
+          color: var(--muted);
         }}
         pre {{
           margin: 0;
@@ -909,6 +1055,18 @@ def page(*, title: str, current_nav: str, body: str) -> str:
           font-family: "SFMono-Regular", Menlo, monospace;
           font-size: 12px;
           line-height: 1.5;
+        }}
+        mark.overlap-current {{
+          background: rgba(185, 128, 20, 0.22);
+          color: inherit;
+          padding: 0 2px;
+          border-radius: 4px;
+        }}
+        mark.overlap-other {{
+          background: rgba(15, 92, 115, 0.18);
+          color: inherit;
+          padding: 0 2px;
+          border-radius: 4px;
         }}
         .empty {{
           padding: 14px;
