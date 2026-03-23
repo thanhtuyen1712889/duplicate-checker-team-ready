@@ -50,6 +50,19 @@ def parse_payload(payload: dict[str, Any]) -> tuple[str, str, str, str]:
     return title, google_doc_url, raw_text, import_mode
 
 
+def parse_bulk_urls(payload: dict[str, Any]) -> tuple[list[str], str]:
+    import_mode = (payload.get("import_mode") or "source_only").strip().lower()
+    if import_mode not in {"check", "source_only"}:
+        import_mode = "source_only"
+    urls: list[str] = []
+    raw_block = payload.get("google_doc_urls")
+    if isinstance(raw_block, list):
+        urls = [str(item).strip() for item in raw_block if str(item).strip()]
+    elif isinstance(raw_block, str):
+        urls = [line.strip() for line in raw_block.splitlines() if line.strip()]
+    return urls, import_mode
+
+
 def result_summary(results: list[dict[str, Any]]) -> dict[str, int]:
     counts = {"conflict": 0, "review": 0, "ok": 0}
     for item in results:
@@ -175,6 +188,59 @@ if FastAPI is not None:
                 response["summary"] = result_summary(doc_results)
                 response["results"] = doc_results
             return response
+        except ValueError as exc:
+            raise api_error(str(exc)) from exc
+
+    @app.post("/api/project/{project_id}/add-docs-bulk")
+    async def add_docs_bulk(project_id: int, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        try:
+            urls, import_mode = parse_bulk_urls(payload)
+            if not urls:
+                raise api_error("Vui long nhap it nhat 1 Google Doc URL")
+            if len(urls) > 200:
+                raise api_error("Toi da 200 URL moi lan import")
+            source_only = import_mode == "source_only"
+            items: list[dict[str, Any]] = []
+            success_count = 0
+            failed_count = 0
+            duplicate_count = 0
+            for index, url in enumerate(urls, start=1):
+                try:
+                    response = SERVICE.add_document_from_url(project_id, url, source_only=source_only)
+                    items.append(
+                        {
+                            "index": index,
+                            "url": url,
+                            "status": "ok",
+                            "document_id": int(response["document_id"]),
+                            "title": response.get("title", ""),
+                            "warnings": response.get("warnings", []),
+                            "message": response.get("message", ""),
+                            "queued": bool(response.get("queued")),
+                        }
+                    )
+                    success_count += 1
+                except ValueError as exc:
+                    message = str(exc)
+                    if "da co trong project" in message.lower() or "đã có trong project" in message.lower():
+                        duplicate_count += 1
+                    failed_count += 1
+                    items.append(
+                        {
+                            "index": index,
+                            "url": url,
+                            "status": "error",
+                            "error": message,
+                        }
+                    )
+            return {
+                "import_mode": import_mode,
+                "total": len(urls),
+                "success_count": success_count,
+                "failed_count": failed_count,
+                "duplicate_count": duplicate_count,
+                "items": items,
+            }
         except ValueError as exc:
             raise api_error(str(exc)) from exc
 
@@ -567,20 +633,24 @@ def render_spa() -> str:
       z-index: 999;
       background: rgba(13, 10, 8, 0.58);
       display: grid;
-      place-items: center;
+      align-items: start;
+      justify-items: center;
       padding: 18px;
+      overflow-y: auto;
     }
     .modal {
       width: min(1040px, 100%);
-      max-height: calc(100vh - 36px);
-      overflow: auto;
+      max-height: calc(100vh - 24px);
+      overflow-y: auto;
       border: 1px solid var(--line);
       border-radius: 16px;
       background: var(--panel);
       box-shadow: 0 20px 60px rgba(20, 17, 14, 0.25);
       padding: 16px;
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 12px;
+      margin: 0 auto;
     }
     .modal pre {
       margin: 0;
@@ -591,8 +661,8 @@ def render_spa() -> str:
       border-radius: 12px;
       background: #fff;
       padding: 12px;
-      max-height: 58vh;
-      overflow: auto;
+      max-height: none;
+      overflow: visible;
     }
     .modal-meta {
       color: var(--muted);
@@ -717,6 +787,14 @@ def render_spa() -> str:
               <button class="secondary" title="Xóa nội dung đang nhập" onclick="clearDocForm()">Xóa nội dung</button>
             </div>
             <div id="doc-progress"></div>
+            <label>Import bulk link Google Docs (mỗi dòng 1 link)
+              <textarea id="bulk-doc-urls" rows="6" placeholder="https://docs.google.com/document/d/...&#10;https://docs.google.com/document/d/..."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="secondary" title="Import hàng loạt vào kho nguồn đối chiếu" onclick="bulkImportDocs(true)">Import bulk (làm nguồn)</button>
+              <button class="secondary" title="Thêm hàng loạt và check ngay theo thứ tự" onclick="bulkImportDocs(false)">Bulk thêm & check</button>
+            </div>
+            <div id="bulk-progress"></div>
           </div>
           <div class="card stack">
             <h2>Kho bài đã import</h2>
@@ -921,6 +999,7 @@ def render_spa() -> str:
           <strong>Ngày thêm:</strong> ${escapeHtml(formatDateTime(doc.added_at))}
         `;
         textNode.textContent = doc.raw_text || "(Không có nội dung text)";
+        document.body.style.overflow = "hidden";
         modal.classList.remove("hidden");
       } catch (error) {
         setBanner(error.message, "error");
@@ -931,9 +1010,11 @@ def render_spa() -> str:
       const modal = document.getElementById("doc-preview-modal");
       if (!modal) return;
       if (forceClose) {
+        document.body.style.overflow = "";
         modal.classList.add("hidden");
         return;
       }
+      document.body.style.overflow = "";
       modal.classList.add("hidden");
     }
 
@@ -1129,7 +1210,9 @@ def render_spa() -> str:
       document.getElementById("doc-title").value = "";
       document.getElementById("doc-url").value = "";
       document.getElementById("doc-text").value = "";
+      document.getElementById("bulk-doc-urls").value = "";
       document.getElementById("doc-progress").innerHTML = "";
+      document.getElementById("bulk-progress").innerHTML = "";
     }
 
     async function addDocument(sourceOnly = false) {
@@ -1177,6 +1260,58 @@ def render_spa() -> str:
         await loadDocs();
         if (!sourceOnly) {
           switchTab("results");
+        }
+      } catch (error) {
+        progress.innerHTML = `<div class="banner error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function parseBulkLines() {
+      const block = document.getElementById("bulk-doc-urls").value || "";
+      return block.split("\n").map((line) => line.trim()).filter(Boolean);
+    }
+
+    function renderBulkResult(payload) {
+      const root = document.getElementById("bulk-progress");
+      const level = payload.failed_count > 0 ? "info" : "success";
+      const errors = (payload.items || []).filter((item) => item.status === "error");
+      root.innerHTML = `
+        <div class="banner ${level}">
+          Đã xử lý ${payload.total} link · Thành công ${payload.success_count} · Lỗi ${payload.failed_count} · Trùng ${payload.duplicate_count}
+        </div>
+        ${errors.length ? `
+          <div class="card">
+            <h3>Link lỗi cần xử lý</h3>
+            <ul>
+              ${errors.slice(0, 30).map((item) => `<li>[${item.index}] ${escapeHtml(item.url)} — ${escapeHtml(item.error || "Lỗi không xác định")}</li>`).join("")}
+            </ul>
+          </div>
+        ` : ""}
+      `;
+    }
+
+    async function bulkImportDocs(sourceOnly = true) {
+      if (!state.currentProject) return;
+      const progress = document.getElementById("bulk-progress");
+      const urls = parseBulkLines();
+      if (!urls.length) {
+        progress.innerHTML = `<div class="banner error">Vui lòng nhập ít nhất 1 link Google Docs</div>`;
+        return;
+      }
+      progress.innerHTML = `<div class="banner info">Đang xử lý ${urls.length} link...</div>`;
+      try {
+        const payload = await api(`/api/project/${state.currentProject.id}/add-docs-bulk`, {
+          method: "POST",
+          body: JSON.stringify({
+            google_doc_urls: urls,
+            import_mode: sourceOnly ? "source_only" : "check",
+          }),
+        });
+        renderBulkResult(payload);
+        await loadProjects(state.currentProject.id);
+        await loadDocs();
+        if (!sourceOnly) {
+          await loadResults();
         }
       } catch (error) {
         progress.innerHTML = `<div class="banner error">${escapeHtml(error.message)}</div>`;
