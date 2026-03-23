@@ -836,6 +836,8 @@ class SmartDuplicateService:
                     added_at TEXT NOT NULL,
                     content_hash TEXT NOT NULL DEFAULT '',
                     source_url TEXT NOT NULL DEFAULT '',
+                    doc_role TEXT NOT NULL DEFAULT 'check',
+                    approval_status TEXT NOT NULL DEFAULT 'approved',
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
@@ -872,6 +874,22 @@ class SmartDuplicateService:
                     message TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                """
+            )
+            document_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            if "doc_role" not in document_columns:
+                conn.execute("ALTER TABLE documents ADD COLUMN doc_role TEXT NOT NULL DEFAULT 'check'")
+            if "approval_status" not in document_columns:
+                conn.execute("ALTER TABLE documents ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'approved'")
+            conn.execute(
+                """
+                UPDATE documents
+                SET approval_status = CASE
+                    WHEN approval_status IS NULL OR approval_status = '' THEN 'approved'
+                    ELSE approval_status
+                END
                 """
             )
 
@@ -913,6 +931,7 @@ class SmartDuplicateService:
             The bowl has a secure lid fit and helps reduce leaks during delivery. It stays stackable in busy kitchens.
             """,
             source_url="",
+            source_only=True,
         )
         self.add_document_from_text(
             project["id"],
@@ -951,6 +970,14 @@ class SmartDuplicateService:
 
     def _project_payload(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         doc_count = conn.execute("SELECT COUNT(*) AS total FROM documents WHERE project_id = ?", (row["id"],)).fetchone()["total"]
+        source_doc_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM documents WHERE project_id = ? AND doc_role = 'source'",
+            (row["id"],),
+        ).fetchone()["total"]
+        pending_doc_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM documents WHERE project_id = ? AND approval_status = 'pending'",
+            (row["id"],),
+        ).fetchone()["total"]
         conflict_count = conn.execute(
             "SELECT COUNT(*) AS total FROM comparisons WHERE project_id = ? AND level = 'conflict'",
             (row["id"],),
@@ -964,6 +991,8 @@ class SmartDuplicateService:
             "updated_at": updated_at,
             "template_name": template_title or "Chua co template",
             "doc_count": int(doc_count),
+            "source_doc_count": int(source_doc_count),
+            "pending_doc_count": int(pending_doc_count),
             "conflict_count": int(conflict_count),
             "allowed_zone_config": json.loads(row["allowed_zone_config_json"] or "{}"),
             "has_template": bool(row["template_doc_text"]),
@@ -993,8 +1022,11 @@ class SmartDuplicateService:
             for doc in docs:
                 cursor = conn.execute(
                     """
-                    INSERT INTO documents (project_id, title, raw_text, sections_json, added_at, content_hash, source_url, warnings_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO documents (
+                        project_id, title, raw_text, sections_json, added_at,
+                        content_hash, source_url, doc_role, approval_status, warnings_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_project["id"],
@@ -1004,6 +1036,8 @@ class SmartDuplicateService:
                         doc["added_at"],
                         doc["content_hash"],
                         doc["source_url"],
+                        doc["doc_role"] if "doc_role" in doc.keys() else "check",
+                        doc["approval_status"] if "approval_status" in doc.keys() else "approved",
                         doc["warnings_json"],
                     ),
                 )
@@ -1116,7 +1150,26 @@ class SmartDuplicateService:
             }
         return title, prepared_sections, warnings
 
-    def add_document_from_text(self, project_id: int, title: str, text: str, *, source_url: str = "") -> dict[str, Any]:
+    def _duplicate_document_message(self, row: sqlite3.Row) -> str:
+        doc_role = row["doc_role"] if "doc_role" in row.keys() else "check"
+        role_label = "nguồn đối chiếu" if doc_role == "source" else "bài đã check"
+        doc_title = normalize_space(row["title"]) or f"ID {int(row['id'])}"
+        added_at = row["added_at"] or "-"
+        return (
+            "Bài này đã có trong project. "
+            f"Đã lưu dưới dạng {role_label}: \"{doc_title}\" (ID {int(row['id'])}, lúc {added_at}). "
+            "Mở mục \"Kho bài đã import\" để tìm nhanh."
+        )
+
+    def add_document_from_text(
+        self,
+        project_id: int,
+        title: str,
+        text: str,
+        *,
+        source_url: str = "",
+        source_only: bool = False,
+    ) -> dict[str, Any]:
         with self.connection() as conn:
             config = self._project_config(conn, project_id)
             template_row = conn.execute("SELECT template_doc_text FROM projects WHERE id = ?", (project_id,)).fetchone()
@@ -1125,25 +1178,36 @@ class SmartDuplicateService:
             clean_text, warnings = self._validate_doc_text(text)
             content_digest = text_hash(clean_text)
             existing_by_hash = conn.execute(
-                "SELECT id FROM documents WHERE project_id = ? AND content_hash = ?",
+                "SELECT id, title, added_at, doc_role FROM documents WHERE project_id = ? AND content_hash = ? ORDER BY id DESC LIMIT 1",
                 (project_id, content_digest),
             ).fetchone()
             if existing_by_hash:
-                raise ValueError("Bai nay da co trong project")
+                raise ValueError(self._duplicate_document_message(existing_by_hash))
             if source_url:
                 existing_by_url = conn.execute(
-                    "SELECT id FROM documents WHERE project_id = ? AND source_url = ? AND source_url != ''",
+                    """
+                    SELECT id, title, added_at, doc_role
+                    FROM documents
+                    WHERE project_id = ? AND source_url = ? AND source_url != ''
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
                     (project_id, source_url),
                 ).fetchone()
                 if existing_by_url:
-                    raise ValueError("Bai nay da co trong project")
+                    raise ValueError(self._duplicate_document_message(existing_by_url))
             parsed_title, sections, parse_warnings = self._prepare_document(clean_text, config)
             final_title = normalize_space(title) or parsed_title or f"Tai lieu {int(time.time())}"
             warnings.extend(parse_warnings)
+            doc_role = "source" if source_only else "check"
+            approval_status = "approved" if source_only else "pending"
             cursor = conn.execute(
                 """
-                INSERT INTO documents (project_id, title, raw_text, sections_json, added_at, content_hash, source_url, warnings_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents (
+                    project_id, title, raw_text, sections_json, added_at,
+                    content_hash, source_url, doc_role, approval_status, warnings_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -1153,14 +1217,28 @@ class SmartDuplicateService:
                     utc_now(),
                     content_digest,
                     source_url,
+                    doc_role,
+                    approval_status,
                     json.dumps(warnings, ensure_ascii=False),
                 ),
             )
             document_id = int(cursor.lastrowid)
             conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
-            doc_count = conn.execute("SELECT COUNT(*) AS total FROM documents WHERE project_id = ?", (project_id,)).fetchone()["total"]
-        if int(doc_count) > 50:
-            self._set_job(project_id, "running", 0, int(doc_count) - 1, "Dang so sanh nen...")
+            compare_target_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM documents WHERE project_id = ? AND doc_role = 'source' AND id != ?",
+                (project_id, document_id),
+            ).fetchone()["total"]
+        if source_only:
+            return {
+                "document_id": document_id,
+                "title": final_title,
+                "queued": False,
+                "warnings": warnings,
+                "results": [],
+                "message": "Đã import bài đã pass vào kho nguồn đối chiếu.",
+            }
+        if int(compare_target_count) > 50:
+            self._set_job(project_id, "running", 0, int(compare_target_count), "Dang so sanh nen...")
             thread = threading.Thread(target=self._compare_document_background, args=(project_id, document_id), daemon=True)
             thread.start()
             return {
@@ -1179,9 +1257,16 @@ class SmartDuplicateService:
             "results": comparisons,
         }
 
-    def add_document_from_url(self, project_id: int, url: str, *, title: str = "") -> dict[str, Any]:
+    def add_document_from_url(
+        self,
+        project_id: int,
+        url: str,
+        *,
+        title: str = "",
+        source_only: bool = False,
+    ) -> dict[str, Any]:
         text, fetch_warnings = fetch_google_doc_text(url)
-        result = self.add_document_from_text(project_id, title, text, source_url=url)
+        result = self.add_document_from_text(project_id, title, text, source_url=url, source_only=source_only)
         result["warnings"] = fetch_warnings + result.get("warnings", [])
         return result
 
@@ -1215,13 +1300,49 @@ class SmartDuplicateService:
                         "title": row["title"],
                         "added_at": row["added_at"],
                         "source_url": row["source_url"],
+                        "doc_role": row["doc_role"] or "check",
+                        "approval_status": row["approval_status"] or "approved",
+                        "role_label": "Nguồn đối chiếu" if (row["doc_role"] or "check") == "source" else "Bài check",
                         "warning_count": len(json.loads(row["warnings_json"] or "[]")),
                         "conflict_count": int(red_count),
                         "review_count": int(yellow_count),
+                        "quality_status": "conflict" if int(red_count) else ("review" if int(yellow_count) else "pass"),
                         "status": "🔴" if int(red_count) else ("🟡" if int(yellow_count) else "✅"),
                     }
                 )
             return payload
+
+    def approve_document(self, document_id: int) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute("SELECT id, project_id, title FROM documents WHERE id = ?", (document_id,)).fetchone()
+            if not row:
+                raise ValueError("Khong tim thay bai")
+            conn.execute(
+                """
+                UPDATE documents
+                SET doc_role = 'source', approval_status = 'approved'
+                WHERE id = ?
+                """,
+                (document_id,),
+            )
+            conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), int(row["project_id"])))
+        return {"id": int(row["id"]), "title": row["title"], "status": "approved"}
+
+    def reject_document(self, document_id: int) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute("SELECT id, project_id, title FROM documents WHERE id = ?", (document_id,)).fetchone()
+            if not row:
+                raise ValueError("Khong tim thay bai")
+            conn.execute(
+                """
+                UPDATE documents
+                SET doc_role = 'check', approval_status = 'rejected'
+                WHERE id = ?
+                """,
+                (document_id,),
+            )
+            conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), int(row["project_id"])))
+        return {"id": int(row["id"]), "title": row["title"], "status": "rejected"}
 
     def remove_document(self, document_id: int) -> None:
         with self.connection() as conn:
@@ -1374,7 +1495,11 @@ class SmartDuplicateService:
                     raise ValueError("Khong tim thay bai")
                 sections_a = json.loads(doc_a["sections_json"])
                 others = conn.execute(
-                    "SELECT * FROM documents WHERE project_id = ? AND id != ? ORDER BY added_at ASC",
+                    """
+                    SELECT * FROM documents
+                    WHERE project_id = ? AND id != ? AND doc_role = 'source'
+                    ORDER BY added_at ASC
+                    """,
                     (project_id, document_id),
                 ).fetchall()
                 total = len(others)
@@ -1795,9 +1920,10 @@ class SmartDuplicateService:
                 cursor = conn.execute(
                     """
                     INSERT INTO documents (
-                        project_id, title, raw_text, sections_json, added_at, content_hash, source_url, warnings_json
+                        project_id, title, raw_text, sections_json, added_at,
+                        content_hash, source_url, doc_role, approval_status, warnings_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_project["id"],
@@ -1807,6 +1933,8 @@ class SmartDuplicateService:
                         row.get("added_at", utc_now()),
                         row.get("content_hash", text_hash(row.get("raw_text", ""))),
                         row.get("source_url", ""),
+                        row.get("doc_role", "check"),
+                        row.get("approval_status", "approved"),
                         row.get("warnings_json", "[]"),
                     ),
                 )
@@ -1883,6 +2011,7 @@ class SmartDuplicateService:
                 Use Cases
                 Ideal for salad bowls, noodle bowls, and rice meal service in busy lunch and dinner operations.
                 """,
+                source_only=True,
             )
             doc_identical = service.add_document_from_text(
                 project["id"],

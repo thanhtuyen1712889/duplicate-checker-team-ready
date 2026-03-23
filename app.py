@@ -40,11 +40,14 @@ def api_error(message: str, status_code: int = 400) -> HTTPException:
     return HTTPException(status_code=status_code, detail=message)
 
 
-def parse_payload(payload: dict[str, Any]) -> tuple[str, str, str]:
+def parse_payload(payload: dict[str, Any]) -> tuple[str, str, str, str]:
     title = (payload.get("title") or "").strip()
     google_doc_url = (payload.get("google_doc_url") or "").strip()
     raw_text = (payload.get("raw_text") or "").strip()
-    return title, google_doc_url, raw_text
+    import_mode = (payload.get("import_mode") or "check").strip().lower()
+    if import_mode not in {"check", "source_only"}:
+        import_mode = "check"
+    return title, google_doc_url, raw_text, import_mode
 
 
 def result_summary(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -125,7 +128,7 @@ if FastAPI is not None:
     @app.post("/api/project/{project_id}/template")
     async def upload_template(project_id: int, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         try:
-            title, google_doc_url, raw_text = parse_payload(payload)
+            title, google_doc_url, raw_text, _import_mode = parse_payload(payload)
             if google_doc_url:
                 text, warnings = fetch_google_doc_text(google_doc_url)
             else:
@@ -154,18 +157,23 @@ if FastAPI is not None:
     @app.post("/api/project/{project_id}/add-doc")
     async def add_doc(project_id: int, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         try:
-            title, google_doc_url, raw_text = parse_payload(payload)
+            title, google_doc_url, raw_text, import_mode = parse_payload(payload)
+            source_only = import_mode == "source_only"
             if google_doc_url:
-                response = SERVICE.add_document_from_url(project_id, google_doc_url, title=title)
+                response = SERVICE.add_document_from_url(project_id, google_doc_url, title=title, source_only=source_only)
             elif raw_text:
-                response = SERVICE.add_document_from_text(project_id, title, raw_text)
+                response = SERVICE.add_document_from_text(project_id, title, raw_text, source_only=source_only)
             else:
                 raise api_error("Vui long dan Google Doc URL hoac raw text")
             if response.get("queued"):
                 return response
-            doc_results = SERVICE.project_results(project_id, doc_id=int(response["document_id"]))
-            response["summary"] = result_summary(doc_results)
-            response["results"] = doc_results
+            if source_only:
+                response["summary"] = {"conflict": 0, "review": 0, "ok": 0}
+                response["results"] = []
+            else:
+                doc_results = SERVICE.project_results(project_id, doc_id=int(response["document_id"]))
+                response["summary"] = result_summary(doc_results)
+                response["results"] = doc_results
             return response
         except ValueError as exc:
             raise api_error(str(exc)) from exc
@@ -262,6 +270,22 @@ if FastAPI is not None:
         try:
             results = SERVICE.recheck_document(document_id)
             return {"results": results}
+        except ValueError as exc:
+            raise api_error(str(exc)) from exc
+
+    @app.post("/api/document/{document_id}/approve")
+    async def approve_document(document_id: int) -> dict[str, Any]:
+        try:
+            payload = SERVICE.approve_document(document_id)
+            return payload
+        except ValueError as exc:
+            raise api_error(str(exc)) from exc
+
+    @app.post("/api/document/{document_id}/reject")
+    async def reject_document(document_id: int) -> dict[str, Any]:
+        try:
+            payload = SERVICE.reject_document(document_id)
+            return payload
         except ValueError as exc:
             raise api_error(str(exc)) from exc
 else:  # pragma: no cover - used only when dependencies are missing
@@ -644,9 +668,36 @@ def render_spa() -> str:
             </label>
             <div class="toolbar">
               <button title="Thêm bài và kiểm tra ngay" onclick="addDocument()">Thêm & Check ngay</button>
+              <button class="secondary" title="Import bài đã pass vào kho nguồn đối chiếu" onclick="addDocument(true)">Import bài đã pass (làm nguồn)</button>
               <button class="secondary" title="Xóa nội dung đang nhập" onclick="clearDocForm()">Xóa nội dung</button>
             </div>
             <div id="doc-progress"></div>
+          </div>
+          <div class="card stack">
+            <h2>Kho bài đã import</h2>
+            <p>Dùng kho này để tra nhanh bài đã có trong project và lọc riêng bài đã PASS hoặc bài nguồn đối chiếu.</p>
+            <div id="quick-library-summary" class="summary-row"></div>
+            <div class="filters">
+              <label>Tìm nhanh
+                <input id="quick-doc-search" placeholder="Tên bài hoặc link nguồn..." oninput="renderQuickLibrary()" />
+              </label>
+              <label>Loại bài
+                <select id="quick-doc-role" onchange="renderQuickLibrary()">
+                  <option value="">Tất cả</option>
+                  <option value="check">Bài check</option>
+                  <option value="source">Nguồn đối chiếu</option>
+                </select>
+              </label>
+              <label>Chất lượng
+                <select id="quick-doc-status" onchange="renderQuickLibrary()">
+                  <option value="">Tất cả</option>
+                  <option value="pass">✅ PASS</option>
+                  <option value="review">🟡 Xem lại</option>
+                  <option value="conflict">🔴 Xung đột</option>
+                </select>
+              </label>
+            </div>
+            <div id="quick-doc-list-wrap"></div>
           </div>
           <div id="new-doc-inline-results" class="stack"></div>
         </section>
@@ -655,6 +706,7 @@ def render_spa() -> str:
           <div class="card">
             <h2>Kết quả</h2>
             <div id="results-summary" class="summary-row"></div>
+            <div id="decision-panel"></div>
             <div id="project-progress-banner"></div>
             <div class="filters">
               <label>Mức độ
@@ -837,7 +889,8 @@ def render_spa() -> str:
           <strong>${escapeHtml(project.name)}</strong>
           <div class="project-meta">
             Bài mẫu: ${escapeHtml(project.template_name)}<br/>
-            ${project.doc_count} bài · ${project.conflict_count} xung đột<br/>
+            ${project.doc_count} bài (${project.source_doc_count || 0} nguồn) · ${project.conflict_count} xung đột<br/>
+            ${project.pending_doc_count || 0} bài chờ duyệt<br/>
             Cập nhật: ${escapeHtml(formatDateTime(project.updated_at))}
           </div>
         </div>
@@ -905,7 +958,7 @@ def render_spa() -> str:
       shell.classList.remove("hidden");
       document.getElementById("project-name-badge").textContent = state.currentProject.name;
       document.getElementById("project-template-badge").textContent = `Bài mẫu: ${state.currentProject.template_name}`;
-      document.getElementById("project-doc-badge").textContent = `${state.currentProject.doc_count} bài`;
+      document.getElementById("project-doc-badge").textContent = `${state.currentProject.doc_count} bài · ${state.currentProject.source_doc_count || 0} nguồn`;
       document.getElementById("project-conflict-badge").textContent = `${state.currentProject.conflict_count} xung đột`;
       document.getElementById("export-xlsx-link").href = `/api/project/${state.currentProject.id}/export?format=xlsx`;
       document.getElementById("export-zip-link").href = `/api/project/${state.currentProject.id}/export?format=zip`;
@@ -985,10 +1038,13 @@ def render_spa() -> str:
       document.getElementById("doc-progress").innerHTML = "";
     }
 
-    async function addDocument() {
+    async function addDocument(sourceOnly = false) {
       if (!state.currentProject) return;
       const progress = document.getElementById("doc-progress");
-      progress.innerHTML = `<div class="banner info">Đang tải bài... → Đang phân tích cấu trúc... → Đang so sánh...</div>`;
+      const progressLabel = sourceOnly
+        ? "Đang tải bài... → Đang phân tích cấu trúc... → Đang lưu vào kho nguồn..."
+        : "Đang tải bài... → Đang phân tích cấu trúc... → Đang so sánh...";
+      progress.innerHTML = `<div class="banner info">${progressLabel}</div>`;
       document.getElementById("new-doc-inline-results").innerHTML = "";
       try {
         const payload = await api(`/api/project/${state.currentProject.id}/add-doc`, {
@@ -997,9 +1053,10 @@ def render_spa() -> str:
             title: document.getElementById("doc-title").value,
             google_doc_url: document.getElementById("doc-url").value,
             raw_text: document.getElementById("doc-text").value,
+            import_mode: sourceOnly ? "source_only" : "check",
           }),
         });
-        state.lastAddedDocId = payload.document_id;
+        state.lastAddedDocId = sourceOnly ? null : payload.document_id;
         if (payload.queued) {
           progress.innerHTML = `<div class="banner info">${escapeHtml(payload.message)}</div>`;
           await pollProjectStatus();
@@ -1008,12 +1065,25 @@ def render_spa() -> str:
           switchTab("results");
           return;
         }
-        progress.innerHTML = `<div class="banner success">Đã thêm bài và kiểm tra xong</div>`;
-        renderInlineResults(payload);
+        if (sourceOnly) {
+          progress.innerHTML = `<div class="banner success">${escapeHtml(payload.message || "Đã import bài vào kho nguồn đối chiếu")}</div>`;
+          renderInlineResults({
+            ...payload,
+            summary: { conflict: 0, review: 0, ok: 0 },
+            results: [],
+          });
+        } else {
+          progress.innerHTML = `<div class="banner success">Đã thêm bài và kiểm tra xong</div>`;
+          renderInlineResults(payload);
+        }
         await loadProjects(state.currentProject.id);
-        await loadResults(payload.document_id);
+        if (!sourceOnly) {
+          await loadResults(payload.document_id);
+        }
         await loadDocs();
-        switchTab("results");
+        if (!sourceOnly) {
+          switchTab("results");
+        }
       } catch (error) {
         progress.innerHTML = `<div class="banner error">${escapeHtml(error.message)}</div>`;
       }
@@ -1043,6 +1113,7 @@ def render_spa() -> str:
     function renderInlineResults(payload) {
       const root = document.getElementById("new-doc-inline-results");
       const summary = payload.summary || { conflict: 0, review: 0, ok: 0 };
+      const hasResultRows = (payload.results || []).length > 0;
       root.innerHTML = `
         <div class="card">
           <div class="summary-row">
@@ -1050,9 +1121,68 @@ def render_spa() -> str:
             <span class="badge amber">${summary.review} cần xem lại</span>
             <span class="badge green">${summary.ok} mục ổn</span>
           </div>
-          <p>Bài: ${escapeHtml(payload.title)} — Đã tạo ${(payload.results || []).length} dòng kết quả trong dự án.</p>
+          <p>Bài: ${escapeHtml(payload.title)} — ${hasResultRows ? `Đã tạo ${(payload.results || []).length} dòng kết quả trong dự án.` : "Đã lưu vào kho nguồn đối chiếu."}</p>
         </div>
       `;
+    }
+
+    function renderDecisionPanel() {
+      const root = document.getElementById("decision-panel");
+      if (!root) return;
+      if (!state.lastAddedDocId) {
+        root.innerHTML = "";
+        return;
+      }
+      const currentDoc = (state.documents || []).find((doc) => doc.id === state.lastAddedDocId);
+      if (!currentDoc) {
+        root.innerHTML = "";
+        return;
+      }
+      if (currentDoc.doc_role === "source") {
+        root.innerHTML = `
+          <div class="banner success">
+            Bài "${escapeHtml(currentDoc.title)}" đã được duyệt và đang nằm trong kho nguồn đối chiếu.
+          </div>
+        `;
+        return;
+      }
+      const approval = currentDoc.approval_status || "pending";
+      const statusText = approval === "rejected"
+        ? "Đang ở trạng thái không duyệt. Team cần sửa nội dung rồi kiểm tra lại."
+        : "Bài đang chờ duyệt. Nếu duyệt, bài sẽ vào kho nguồn để đối chiếu các lần check sau.";
+      root.innerHTML = `
+        <div class="banner info">
+          <strong>Quyết định bài vừa check:</strong> ${escapeHtml(statusText)}
+          <div class="toolbar" style="margin-top:8px;">
+            <button onclick="approveDocForSource(${currentDoc.id})">Duyệt đưa vào kho nguồn</button>
+            <button class="secondary" onclick="rejectDocForRevision(${currentDoc.id})">Không duyệt (team sửa & recheck)</button>
+          </div>
+        </div>
+      `;
+    }
+
+    async function approveDocForSource(docId) {
+      try {
+        await api(`/api/document/${docId}/approve`, { method: "POST", body: JSON.stringify({}) });
+        setBanner("Đã duyệt bài và chuyển vào kho nguồn đối chiếu", "success");
+        await loadProjects(state.currentProject.id);
+        await loadDocs();
+        await loadResults(docId);
+      } catch (error) {
+        setBanner(error.message, "error");
+      }
+    }
+
+    async function rejectDocForRevision(docId) {
+      try {
+        await api(`/api/document/${docId}/reject`, { method: "POST", body: JSON.stringify({}) });
+        setBanner("Đã đánh dấu không duyệt. Team có thể sửa và kiểm tra lại.", "info");
+        await loadProjects(state.currentProject.id);
+        await loadDocs();
+        await loadResults(docId);
+      } catch (error) {
+        setBanner(error.message, "error");
+      }
     }
 
     async function loadResults(docId = state.lastAddedDocId) {
@@ -1081,6 +1211,7 @@ def render_spa() -> str:
           <span class="badge">${payload.comparison_count} cặp đã được so sánh</span>
         `;
         renderResultsTable(payload.results);
+        renderDecisionPanel();
       } catch (error) {
         setBanner(error.message, "error");
       }
@@ -1168,55 +1299,104 @@ def render_spa() -> str:
       `;
     }
 
+    function applyDocFilters(docs) {
+      const search = (document.getElementById("quick-doc-search")?.value || "").toLowerCase().trim();
+      const role = document.getElementById("quick-doc-role")?.value || "";
+      const status = document.getElementById("quick-doc-status")?.value || "";
+      return docs.filter((doc) => {
+        if (role && doc.doc_role !== role) return false;
+        if (status && doc.quality_status !== status) return false;
+        if (!search) return true;
+        const haystack = `${doc.title} ${doc.source_url || ""}`.toLowerCase();
+        return haystack.includes(search);
+      });
+    }
+
+    function renderLibrarySummary(docs) {
+      const root = document.getElementById("quick-library-summary");
+      if (!root) return;
+      const total = docs.length;
+      const pass = docs.filter((doc) => doc.quality_status === "pass").length;
+      const review = docs.filter((doc) => doc.quality_status === "review").length;
+      const conflict = docs.filter((doc) => doc.quality_status === "conflict").length;
+      const source = docs.filter((doc) => doc.doc_role === "source").length;
+      root.innerHTML = `
+        <span class="badge">${total} bài đã lưu</span>
+        <span class="badge green">${pass} PASS</span>
+        <span class="badge amber">${review} xem lại</span>
+        <span class="badge red">${conflict} xung đột</span>
+        <span class="badge">${source} bài nguồn</span>
+      `;
+    }
+
+    function renderDocsTable(targetId, docs) {
+      const root = document.getElementById(targetId);
+      if (!root) return;
+      if (!docs.length) {
+        root.innerHTML = `<div class="empty-state"><strong>Chưa có bài nào phù hợp bộ lọc.</strong></div>`;
+        return;
+      }
+      root.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Bài</th>
+              <th>Loại</th>
+              <th>Duyệt</th>
+              <th>Ngày thêm</th>
+              <th>Xung đột</th>
+              <th>Xem lại</th>
+              <th>Trạng thái</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${docs.map((doc) => `
+              <tr>
+                <td>${escapeHtml(doc.title)}</td>
+                <td>${doc.doc_role === "source" ? "📚 Nguồn đối chiếu" : "📝 Bài check"}</td>
+                <td>${doc.doc_role === "source" ? "✅ Đã duyệt" : (doc.approval_status === "rejected" ? "⛔ Không duyệt" : "⏳ Chờ duyệt")}</td>
+                <td>${escapeHtml(formatDateTime(doc.added_at))}</td>
+                <td>${doc.conflict_count}</td>
+                <td>${doc.review_count}</td>
+                <td>${doc.quality_status === "conflict" ? "🔴 Xung đột" : (doc.quality_status === "review" ? "🟡 Xem lại" : "✅ PASS")}</td>
+                <td>
+                  <div class="toolbar">
+                    ${doc.source_url ? `<a class="link-button secondary" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">Mở nguồn</a>` : ""}
+                    ${doc.doc_role !== "source" ? `<button title="Duyệt bài này vào kho nguồn" onclick="approveDocForSource(${doc.id})">Duyệt</button>` : ""}
+                    ${doc.doc_role !== "source" ? `<button class="secondary" title="Không duyệt, giữ lại để sửa và recheck" onclick="rejectDocForRevision(${doc.id})">Không duyệt</button>` : ""}
+                    <button class="secondary" title="Kiểm tra lại bài này" onclick="recheckDoc(${doc.id})">Kiểm tra lại</button>
+                    <button class="danger" title="Xóa bài khỏi dự án" onclick="deleteDoc(${doc.id})">Xóa</button>
+                  </div>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderQuickLibrary() {
+      const filteredDocs = applyDocFilters(state.documents || []);
+      renderLibrarySummary(state.documents || []);
+      renderDocsTable("quick-doc-list-wrap", filteredDocs);
+    }
+
     async function loadDocs() {
       if (!state.currentProject) return;
       try {
         const payload = await api(`/api/project/${state.currentProject.id}/docs`);
         const docs = payload.documents;
         state.documents = docs;
-        const root = document.getElementById("doc-list-wrap");
         const filterRoot = document.getElementById("filter-other-doc");
         if (filterRoot) {
           const currentValue = filterRoot.value;
           filterRoot.innerHTML = `<option value="">Tất cả bài</option>` + docs.map((doc) => `<option value="${doc.id}">${escapeHtml(doc.title)}</option>`).join("");
           filterRoot.value = currentValue;
         }
-        if (!docs.length) {
-          root.innerHTML = `<div class="empty-state"><strong>Chưa có bài nào trong dự án.</strong></div>`;
-          return;
-        }
-        root.innerHTML = `
-          <table>
-            <thead>
-              <tr>
-                <th>Bài</th>
-                <th>Ngày thêm</th>
-                <th>Xung đột</th>
-                <th>Xem lại</th>
-                <th>Trạng thái</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              ${docs.map((doc) => `
-                <tr>
-                  <td>${escapeHtml(doc.title)}</td>
-                  <td>${escapeHtml(formatDateTime(doc.added_at))}</td>
-                  <td>${doc.conflict_count}</td>
-                  <td>${doc.review_count}</td>
-                  <td>${doc.status}</td>
-                  <td>
-                    <div class="toolbar">
-                      ${doc.source_url ? `<a class="link-button secondary" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">Mở nguồn</a>` : ""}
-                      <button class="secondary" title="Kiểm tra lại bài này" onclick="recheckDoc(${doc.id})">Kiểm tra lại</button>
-                      <button class="danger" title="Xóa bài khỏi dự án" onclick="deleteDoc(${doc.id})">Xóa</button>
-                    </div>
-                  </td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-        `;
+        renderQuickLibrary();
+        renderDocsTable("doc-list-wrap", docs);
+        renderDecisionPanel();
       } catch (error) {
         setBanner(error.message, "error");
       }

@@ -80,6 +80,111 @@ class SmartDuplicateCoreTests(unittest.TestCase):
         self.assertTrue(summary["different_expected"])
         self.assertTrue(summary["spec_guard_expected"])
 
+    def test_import_source_only_is_saved_in_library(self) -> None:
+        service = self.make_service()
+        project = service.create_project("Source Library")
+        service.set_template_from_text(
+            project["id"],
+            """
+            PRODUCT TITLE
+
+            FEATURES
+            The container keeps food protected during takeaway delivery.
+            """,
+        )
+        import_result = service.add_document_from_text(
+            project["id"],
+            "Nguon da pass",
+            """
+            Product A
+
+            Features
+            The container keeps food protected during takeaway delivery.
+            """,
+            source_only=True,
+        )
+        self.assertEqual(import_result["results"], [])
+        docs = service.list_documents(project["id"])
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["doc_role"], "source")
+
+    def test_duplicate_message_points_to_existing_library_doc(self) -> None:
+        service = self.make_service()
+        project = service.create_project("Duplicate Message")
+        service.set_template_from_text(
+            project["id"],
+            """
+            PRODUCT TITLE
+
+            INTRO
+            This product is designed for professional takeaway use.
+            """,
+        )
+        service.add_document_from_text(
+            project["id"],
+            "Bai da luu",
+            """
+            Product A
+
+            Intro
+            This product is designed for professional takeaway use.
+            """,
+            source_url="https://docs.google.com/document/d/example-id/edit",
+            source_only=True,
+        )
+        with self.assertRaises(ValueError) as raised:
+            service.add_document_from_text(
+                project["id"],
+                "Bai trung",
+                """
+                Product B
+
+                Intro
+                This product is designed for professional takeaway use.
+                """,
+                source_url="https://docs.google.com/document/d/example-id/edit",
+            )
+        self.assertIn("Kho bài đã import", str(raised.exception))
+        self.assertIn("Bai da luu", str(raised.exception))
+
+    def test_pending_docs_are_not_used_as_compare_source_until_approved(self) -> None:
+        service = self.make_service()
+        project = service.create_project("Approval Gate")
+        service.set_template_from_text(
+            project["id"],
+            """
+            PRODUCT TITLE
+
+            FEATURES
+            The container stays stackable and supports secure lid closure.
+            """,
+        )
+        first = service.add_document_from_text(
+            project["id"],
+            "Pending 1",
+            """
+            Product One
+
+            Features
+            The container stays stackable and supports secure lid closure.
+            """,
+        )
+        second = service.add_document_from_text(
+            project["id"],
+            "Pending 2",
+            """
+            Product Two
+
+            Features
+            The container stays stackable and supports secure lid closure.
+            """,
+        )
+        self.assertEqual(first["results"], [])
+        self.assertEqual(second["results"], [])
+        service.approve_document(first["document_id"])
+        rechecked = service.recheck_document(second["document_id"])
+        self.assertTrue(any(item["doc_b_title"] == "Pending 1" for item in rechecked))
+
 
 if __name__ == "__main__":
     unittest.main()
