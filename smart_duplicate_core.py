@@ -1319,6 +1319,36 @@ class SmartDuplicateService:
                 )
             return payload
 
+    def get_document(self, document_id: int) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+            if not row:
+                raise ValueError("Khong tim thay bai")
+        try:
+            sections = json.loads(row["sections_json"] or "{}")
+        except json.JSONDecodeError:
+            sections = {}
+        warnings = json.loads(row["warnings_json"] or "[]")
+        normalized_sections: dict[str, Any] = {}
+        for key, payload in sections.items():
+            if isinstance(payload, dict):
+                normalized_sections[key] = {
+                    "title": payload.get("title", key),
+                    "text": payload.get("text", ""),
+                }
+        return {
+            "id": int(row["id"]),
+            "project_id": int(row["project_id"]),
+            "title": row["title"],
+            "raw_text": row["raw_text"],
+            "sections": normalized_sections,
+            "source_url": row["source_url"],
+            "doc_role": row["doc_role"] or "check",
+            "approval_status": row["approval_status"] or "approved",
+            "added_at": row["added_at"],
+            "warnings": warnings,
+        }
+
     def approve_document(self, document_id: int) -> dict[str, Any]:
         with self.connection() as conn:
             row = conn.execute("SELECT id, project_id, title FROM documents WHERE id = ?", (document_id,)).fetchone()

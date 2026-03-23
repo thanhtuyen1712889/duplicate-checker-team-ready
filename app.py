@@ -288,6 +288,14 @@ if FastAPI is not None:
             return payload
         except ValueError as exc:
             raise api_error(str(exc)) from exc
+
+    @app.get("/api/document/{document_id}")
+    async def get_document(document_id: int) -> dict[str, Any]:
+        try:
+            document = SERVICE.get_document(document_id)
+            return {"document": document}
+        except ValueError as exc:
+            raise api_error(str(exc), status_code=404) from exc
 else:  # pragma: no cover - used only when dependencies are missing
     app = None
 
@@ -553,6 +561,43 @@ def render_spa() -> str:
       color: var(--brand);
       font-size: 13px;
     }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 999;
+      background: rgba(13, 10, 8, 0.58);
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }
+    .modal {
+      width: min(1040px, 100%);
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: 0 20px 60px rgba(20, 17, 14, 0.25);
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .modal pre {
+      margin: 0;
+      white-space: pre-wrap;
+      font-size: 15px;
+      line-height: 1.5;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 12px;
+      max-height: 58vh;
+      overflow: auto;
+    }
+    .modal-meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; }
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -759,6 +804,16 @@ def render_spa() -> str:
       </section>
     </main>
   </div>
+  <div id="doc-preview-modal" class="modal-backdrop hidden" onclick="closeDocPreview(true)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="toolbar">
+        <h2 id="doc-preview-title" style="margin:0;">Nội dung bài</h2>
+        <button class="secondary" onclick="closeDocPreview(false)">Đóng</button>
+      </div>
+      <div id="doc-preview-meta" class="modal-meta"></div>
+      <pre id="doc-preview-text"></pre>
+    </div>
+  </div>
   <script>
     const state = {
       projects: [],
@@ -841,6 +896,45 @@ def render_spa() -> str:
       if (mode === "semantic_only_multilingual") return "mô hình đa ngôn ngữ";
       if (mode === "fallback") return "chế độ cục bộ";
       return mode || "-";
+    }
+
+    async function openTextDoc(documentId) {
+      try {
+        const payload = await api(`/api/document/${documentId}`);
+        const doc = payload.document || {};
+        const modal = document.getElementById("doc-preview-modal");
+        const titleNode = document.getElementById("doc-preview-title");
+        const metaNode = document.getElementById("doc-preview-meta");
+        const textNode = document.getElementById("doc-preview-text");
+        titleNode.textContent = doc.title || `Bài #${documentId}`;
+        const roleLabel = doc.doc_role === "source" ? "Nguồn đối chiếu" : "Bài check";
+        const approvalLabel = doc.doc_role === "source"
+          ? "Đã duyệt"
+          : (doc.approval_status === "rejected" ? "Không duyệt" : "Chờ duyệt");
+        const sections = Object.keys(doc.sections || {});
+        const warningCount = Array.isArray(doc.warnings) ? doc.warnings.length : 0;
+        metaNode.innerHTML = `
+          <strong>Loại:</strong> ${escapeHtml(roleLabel)} ·
+          <strong>Duyệt:</strong> ${escapeHtml(approvalLabel)} ·
+          <strong>Section:</strong> ${sections.length} ·
+          <strong>Cảnh báo:</strong> ${warningCount} ·
+          <strong>Ngày thêm:</strong> ${escapeHtml(formatDateTime(doc.added_at))}
+        `;
+        textNode.textContent = doc.raw_text || "(Không có nội dung text)";
+        modal.classList.remove("hidden");
+      } catch (error) {
+        setBanner(error.message, "error");
+      }
+    }
+
+    function closeDocPreview(forceClose = false) {
+      const modal = document.getElementById("doc-preview-modal");
+      if (!modal) return;
+      if (forceClose) {
+        modal.classList.add("hidden");
+        return;
+      }
+      modal.classList.add("hidden");
     }
 
     function commonHighlight(text, reference, level) {
@@ -1357,13 +1451,13 @@ def render_spa() -> str:
                 <td>
                   ${doc.source_url
                     ? `<a class="link-button" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(doc.title)}</a>`
-                    : `<strong>${escapeHtml(doc.title)}</strong>`
+                    : `<button class="secondary" title="Mở nội dung bài dán text" onclick="openTextDoc(${doc.id})">${escapeHtml(doc.title)}</button>`
                   }
                 </td>
                 <td>
                   ${doc.source_url
                     ? `<a class="link-button secondary" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">Mở Google Doc</a>`
-                    : `<span class="project-meta">Không có link nguồn (bài dán text)</span>`
+                    : `<button class="secondary" title="Xem nội dung bài dán text" onclick="openTextDoc(${doc.id})">Xem nội dung dán</button>`
                   }
                 </td>
                 <td>${doc.doc_role === "source" ? "📚 Nguồn đối chiếu" : "📝 Bài check"}</td>

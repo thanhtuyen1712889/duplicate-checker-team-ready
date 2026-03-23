@@ -185,6 +185,33 @@ class SmartDuplicateCoreTests(unittest.TestCase):
         rechecked = service.recheck_document(second["document_id"])
         self.assertTrue(any(item["doc_b_title"] == "Pending 1" for item in rechecked))
 
+    def test_get_document_returns_text_for_pasted_doc(self) -> None:
+        service = self.make_service()
+        project = service.create_project("Pasted Detail")
+        service.set_template_from_text(
+            project["id"],
+            """
+            PRODUCT TITLE
+
+            FEATURES
+            The container keeps food protected during takeaway delivery.
+            """,
+        )
+        created = service.add_document_from_text(
+            project["id"],
+            "Pasted only",
+            """
+            Pasted title
+
+            Features
+            A pasted paragraph that should be visible from detail API.
+            """,
+        )
+        detail = service.get_document(created["document_id"])
+        self.assertEqual(detail["title"], "Pasted only")
+        self.assertIn("should be visible", detail["raw_text"])
+        self.assertEqual(detail["source_url"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
