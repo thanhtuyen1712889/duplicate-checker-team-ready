@@ -1341,6 +1341,7 @@ def render_spa() -> str:
           <thead>
             <tr>
               <th>Bài</th>
+              <th>Link nguồn</th>
               <th>Loại</th>
               <th>Duyệt</th>
               <th>Ngày thêm</th>
@@ -1353,7 +1354,18 @@ def render_spa() -> str:
           <tbody>
             ${docs.map((doc) => `
               <tr>
-                <td>${escapeHtml(doc.title)}</td>
+                <td>
+                  ${doc.source_url
+                    ? `<a class="link-button" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(doc.title)}</a>`
+                    : `<strong>${escapeHtml(doc.title)}</strong>`
+                  }
+                </td>
+                <td>
+                  ${doc.source_url
+                    ? `<a class="link-button secondary" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">Mở Google Doc</a>`
+                    : `<span class="project-meta">Không có link nguồn (bài dán text)</span>`
+                  }
+                </td>
                 <td>${doc.doc_role === "source" ? "📚 Nguồn đối chiếu" : "📝 Bài check"}</td>
                 <td>${doc.doc_role === "source" ? "✅ Đã duyệt" : (doc.approval_status === "rejected" ? "⛔ Không duyệt" : "⏳ Chờ duyệt")}</td>
                 <td>${escapeHtml(formatDateTime(doc.added_at))}</td>
@@ -1362,7 +1374,6 @@ def render_spa() -> str:
                 <td>${doc.quality_status === "conflict" ? "🔴 Xung đột" : (doc.quality_status === "review" ? "🟡 Xem lại" : "✅ PASS")}</td>
                 <td>
                   <div class="toolbar">
-                    ${doc.source_url ? `<a class="link-button secondary" href="${escapeHtml(doc.source_url)}" target="_blank" rel="noreferrer">Mở nguồn</a>` : ""}
                     ${doc.doc_role !== "source" ? `<button title="Duyệt bài này vào kho nguồn" onclick="approveDocForSource(${doc.id})">Duyệt</button>` : ""}
                     ${doc.doc_role !== "source" ? `<button class="secondary" title="Không duyệt, giữ lại để sửa và recheck" onclick="rejectDocForRevision(${doc.id})">Không duyệt</button>` : ""}
                     <button class="secondary" title="Kiểm tra lại bài này" onclick="recheckDoc(${doc.id})">Kiểm tra lại</button>
