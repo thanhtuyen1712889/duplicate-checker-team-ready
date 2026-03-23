@@ -892,6 +892,13 @@ class SmartDuplicateService:
                 END
                 """
             )
+            conn.execute(
+                """
+                UPDATE documents
+                SET doc_role = 'source'
+                WHERE doc_role = 'check' AND approval_status = 'approved'
+                """
+            )
 
     def seed_example_project(self) -> None:
         with self.connection() as conn:
